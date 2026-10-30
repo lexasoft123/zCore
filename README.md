@@ -1,60 +1,133 @@
 # zCore
 
-zCore is the shared C++20 audio runtime extracted from SingZ. The extracted engine source baseline is SingZ revision `ac620fb0`. Two runtime
-translation units have a separately reviewed optimization layer, documented by
-`optimizationProvenance` in the source manifest: graph sample containment and
-idle gain traversal. Finite classification preserves exact finite bit patterns;
-Limiter traversal remains unchanged so pre-limit telemetry keeps its current
-meaning. Other extracted engine source bytes match the baseline.
-The package has no root license grant beyond the upstream terms retained beside
-third-party code. Its public CMake
-targets retain the `SingZ::` names used by existing consumers and also expose
-the core package aliases under `zCore::` where appropriate.
+[![Build and tests](https://github.com/lexasoft123/zCore/actions/workflows/zcore.yml/badge.svg)](https://github.com/lexasoft123/zCore/actions/workflows/zcore.yml)
 
-The default build includes reusable audio transport, device providers, the
-real-time graph runtime, host adapter and the legacy live-analysis compatibility
-implementation. File media and delivery-thread analysis are opt-in:
+**zCore is a C++20 audio engine for desktop and mobile applications.** It combines
+realtime DSP graphs, audio-device input and output, streaming media, and live
+input analysis in a library you can embed with CMake.
+
+zCore powers [SingZ](https://github.com/lexasoft123/SingZ) and
+[LoopZ](https://github.com/lexasoft123/LoopZ). Applications build their own playback
+and recording workflows on top of it, with control over permissions, user
+interfaces, and project storage.
+
+## What it provides
+
+- **DSP graphs:** graph compilation and execution, audio buses, gain, mixing,
+  limiting, metering, and latency handling.
+- **Audio sources and scheduling:** decoded buffers, streaming windows,
+  scheduled cues, and gain events.
+- **Device I/O:** capture and playback, device discovery, stream configuration,
+  timestamps, and callback transport behind shared interfaces.
+- **Media and resampling:** WAV, FLAC, and MP3 decoding and streaming sources,
+  plus sample-rate conversion. Extended codecs can use a consumer-supplied
+  FFmpeg integration.
+- **Live analysis:** optional level and pitch analysis with adapters for
+  delivering captured audio outside the realtime callback.
+- **Offline rendering and validation:** offline graph rendering, reusable tests,
+  and DSP benchmarks.
+
+Graph preparation, device lifecycle, and media work are separated from realtime
+processing. Callback and graph-runtime sources have compile restrictions and
+source-policy checks to keep unsafe operations out of those paths.
+
+## Platforms
+
+| Platform | Audio backend | Build requirements |
+| --- | --- | --- |
+| macOS | Core Audio | Xcode command-line tools and the macOS SDK |
+| Windows | WASAPI | Visual Studio C++ tools and the Windows SDK |
+| Linux | ALSA, with udev device support | ALSA and libudev development packages, plus pkg-config |
+| iOS | AudioToolbox and AVAudioSession | Xcode, the iOS SDK, and an Apple toolchain configured by the host project |
+| Android | Oboe | Android NDK and an `oboe::oboe` CMake package supplied by the host project |
+
+Standalone CI builds and tests macOS, Windows, and Linux. Mobile integrations
+supply their platform toolchains and handle application permissions and lifecycle.
+
+## Build and test
+
+Requires **CMake 3.20+** and a **C++20 compiler**. The test utilities also require
+Python 3. On Ubuntu or Debian, install the Linux audio dependencies first:
 
 ```sh
-cmake -S . -B build \
+sudo apt-get update
+sudo apt-get install -y libasound2-dev libudev-dev pkg-config
+```
+
+Build all optional library components and the test suite:
+
+```sh
+git clone https://github.com/lexasoft123/zCore.git
+cd zCore
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
   -DZCORE_BUILD_MEDIA=ON \
   -DZCORE_BUILD_ANALYSIS=ON \
   -DZCORE_BUILD_TESTS=ON
-cmake --build build
-ctest --test-dir build --output-on-failure
+cmake --build build --config Release --parallel 4
+ctest --test-dir build -C Release --output-on-failure
 ```
 
-`ZCORE_BUILD_MEDIA`, `ZCORE_BUILD_ANALYSIS`, `ZCORE_BUILD_TESTS`, and
-`ZCORE_BUILD_BENCHMARKS` default to `OFF`. Runtime and device components are
-always available. A consumer can define `SingZ::native_build_options` before
-adding zCore; standalone builds create that interface target themselves.
+The graph runtime and device components are available in the default build.
+Optional components are controlled independently:
 
-SingZ and LoopZ consume this repository as a pinned Git submodule:
+| Option | Default | Enables |
+| --- | --- | --- |
+| `ZCORE_BUILD_MEDIA` | `OFF` | File decoding and streaming media |
+| `ZCORE_BUILD_ANALYSIS` | `OFF` | Live-input analysis adapters |
+| `ZCORE_BUILD_TESTS` | `OFF` | Reusable CTest suites |
+| `ZCORE_BUILD_BENCHMARKS` | `OFF` | DSP benchmark executables |
+
+## Add to your project
+
+Add zCore as a Git submodule and commit the dependency at a tested revision:
 
 ```sh
-git clone --recurse-submodules <consumer-repository>
-# After pulling a consumer commit that changes the pin:
+git submodule add https://github.com/lexasoft123/zCore.git external/zcore
+```
+
+Then include it in your CMake project. This example enables media support and
+links an application whose sources live in `main.cpp`:
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(MyAudioApp LANGUAGES C CXX)
+
+set(ZCORE_BUILD_MEDIA ON CACHE BOOL "" FORCE)
+add_subdirectory(external/zcore)
+
+add_executable(my_audio_app main.cpp)
+target_link_libraries(my_audio_app PRIVATE
+  zCore::runtime
+  zCore::device
+  SingZ::zcore_media
+)
+```
+
+Choose the components your application needs:
+
+| Component | CMake target | Public headers |
+| --- | --- | --- |
+| Graph runtime | `zCore::runtime` | [`zdsp`](zdsp/include/zdsp) |
+| Audio devices | `zCore::device` | [`zcore/device`](zcore/include/zcore/device) |
+| Capture transport | `zCore::audio` | [`zcore/audio`](zcore/include/zcore/audio) |
+| Resampling | `zCore::resample` | [`resample.h`](zcore/include/zcore/legacy/resample.h) |
+| Device-to-graph adapter | `SingZ::zdsp_host_adapter` | [`audio_host_graph_adapter.h`](zdsp/include/zdsp/audio_host_graph_adapter.h) |
+| Media, when enabled | `SingZ::zcore_media` | [`media`](zcore/include/zcore/media) |
+| Live analysis, when enabled | `SingZ::zdsp_analysis` | [`live_input_analysis.h`](zdsp/include/zdsp/analysis/live_input_analysis.h) |
+| Offline rendering | `SingZ::zdsp_offline` | [`offline_renderer.h`](zdsp/include/zdsp/offline_renderer.h) |
+
+Some component targets currently use the `SingZ::` namespace; use the target
+names listed above when linking.
+
+For an existing consumer checkout, initialize or update its pinned dependency:
+
+```sh
 git submodule update --init --recursive
 ```
 
-Use `https://github.com/lexasoft123/zCore.git` when adding the submodule to a
-new consumer, then select and commit the intended engine revision. SingZ and
-LoopZ may pin different commits while their device-provider baselines differ.
-Consumer builds verify the initialized checkout and reject mismatched or dirty
-submodules; they do not fetch or update dependencies automatically.
+## License and third-party notices
 
-`zcore-source-manifest.json` enumerates extracted component source ownership.
-The scripts `import-zcore.py` and `verify-zcore.py` remain available for historical
-snapshot consumers; current SingZ and LoopZ check the Git submodule pin instead.
-The lower-level `zcore/README.md` and `zdsp/README.md` retain technical design
-history from SingZ; their platform packaging and phase-status notes describe
-that application and are not zCore build instructions.
-
-`zdsp/run-sanitizer-gates.sh` stays with SingZ because it invokes application
-presets and product-only tests. zCore exposes the reusable graph, containment,
-planar and analysis tests directly through CTest.
-
-The FLAC and dr_mp3 source inputs retain their upstream notices in
-`third_party/native/flac` and `third_party/native/dr_mp3`. The optional
-Signalsmith wrapper, ML adapters, product session composition and product tests
-remain in their consuming applications.
+A project-wide license has not yet been declared. Bundled third-party components
+retain their own license notices, including
+[libFLAC](third_party/native/flac/COPYING.Xiph) and
+[dr_mp3](third_party/native/dr_mp3/dr_mp3.h).
