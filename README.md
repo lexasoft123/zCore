@@ -29,10 +29,23 @@ ctest --test-dir build --output-on-failure
 always available. A consumer can define `SingZ::native_build_options` before
 adding zCore; standalone builds create that interface target themselves.
 
-Every package import is generated from an exact full Git commit with
-`scripts/import-zcore.py`; `scripts/verify-zcore.py` checks the snapshot lock,
-including the complete tracked package tree, manifest, build files and scripts.
+SingZ and LoopZ consume this repository as a pinned Git submodule:
+
+```sh
+git clone --recurse-submodules <consumer-repository>
+# After pulling a consumer commit that changes the pin:
+git submodule update --init --recursive
+```
+
+Use `https://github.com/lexasoft123/zCore.git` when adding the submodule to a
+new consumer, then select and commit the intended engine revision. SingZ and
+LoopZ may pin different commits while their device-provider baselines differ.
+Consumer builds verify the initialized checkout and reject mismatched or dirty
+submodules; they do not fetch or update dependencies automatically.
+
 `zcore-source-manifest.json` enumerates extracted component source ownership.
+The scripts `import-zcore.py` and `verify-zcore.py` remain available for historical
+snapshot consumers; current SingZ and LoopZ check the Git submodule pin instead.
 The lower-level `zcore/README.md` and `zdsp/README.md` retain technical design
 history from SingZ; their platform packaging and phase-status notes describe
 that application and are not zCore build instructions.
