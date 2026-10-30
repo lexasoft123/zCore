@@ -13,6 +13,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Linux audio development dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DAUDIOZ_BUILD_MEDIA=ON -DAUDIOZ_BUILD_ANALYSIS=ON -DAUDIOZ_BUILD_TESTS=ON
       - name: Build

@@ -17,6 +17,7 @@
     "cmake/TestPlaybackRealtimePolicy.cmake",
     "cmake/TestZcoreRealtimePolicy.cmake",
     "tests/native/audio_host_ios_link_smoke.cpp",
+    "tests/native/audio_host_linux_tests.cpp",
     "third_party/native/dr_mp3/README.md",
     "third_party/native/dr_mp3/dr_mp3.h",
     "third_party/native/flac/COPYING.Xiph",
@@ -137,6 +138,12 @@
     "zcore/platform/ios/audio_input_ios_session.cpp",
     "zcore/platform/ios/audio_input_ios_session.mm",
     "zcore/platform/ios/audio_input_wake_ios.cpp",
+    "zcore/platform/linux/alsa_capture.cpp",
+    "zcore/platform/linux/alsa_pcm.cpp",
+    "zcore/platform/linux/alsa_pcm.h",
+    "zcore/platform/linux/audio_host_linux.cpp",
+    "zcore/platform/linux/audio_input_linux.cpp",
+    "zcore/platform/linux/audio_input_wake_linux.cpp",
     "zcore/platform/macos/audio_host_macos.cpp",
     "zcore/platform/macos/audio_host_macos_helpers.h",
     "zcore/platform/macos/audio_input_macos.cpp",
@@ -410,5 +417,24 @@
     "importer": [
       "scripts/test-import-audioz.py"
     ]
-  }
+  },
+  "upstreamUpdates": [
+    {
+      "repository": "SingZ",
+      "revision": "ab87a19a0d2cff41d8477a367a043390b44861b6",
+      "paths": [
+        "cmake/TestAndroidAudioHostRealtimePolicy.cmake",
+        "zcore/include/zcore/device/audio_host.h",
+        "zcore/src/device/audio_input.cpp",
+        "zcore/src/device/audio_input_wake.cpp",
+        "tests/native/audio_host_linux_tests.cpp",
+        "zcore/platform/linux/alsa_capture.cpp",
+        "zcore/platform/linux/alsa_pcm.cpp",
+        "zcore/platform/linux/alsa_pcm.h",
+        "zcore/platform/linux/audio_host_linux.cpp",
+        "zcore/platform/linux/audio_input_linux.cpp",
+        "zcore/platform/linux/audio_input_wake_linux.cpp"
+      ]
+    }
+  ]
 }

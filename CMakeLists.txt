@@ -109,6 +109,13 @@ elseif(WIN32)
     zcore/platform/windows/audio_host_windows_provider.cpp zcore/platform/windows/audio_host_asio.cpp
     zcore/platform/windows/audio_input_windows_helpers.cpp zcore/platform/ios/audio_input_ios_session.cpp
     zcore/platform/windows/audio_input_windows.cpp zcore/platform/windows/audio_input_wake_windows.cpp)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  list(APPEND AUDIOZ_DEVICE_SOURCES
+    zcore/platform/android/audio_host_android_callback_policy.cpp
+    zcore/platform/ios/audio_input_ios_session.cpp
+    zcore/platform/linux/alsa_pcm.cpp zcore/platform/linux/alsa_capture.cpp
+    zcore/platform/linux/audio_host_linux.cpp zcore/platform/linux/audio_input_linux.cpp
+    zcore/platform/linux/audio_input_wake_linux.cpp)
 else()
   list(APPEND AUDIOZ_DEVICE_SOURCES zcore/platform/android/audio_host_android_callback_policy.cpp
     zcore/platform/ios/audio_input_ios_session.cpp zcore/platform/unsupported/audio_host_unsupported.cpp)
@@ -120,7 +127,7 @@ target_compile_features(zcore_device PUBLIC cxx_std_20)
 set_target_properties(zcore_device PROPERTIES POSITION_INDEPENDENT_CODE YES)
 target_include_directories(zcore_device PUBLIC zcore/include PRIVATE zcore/platform/android)
 target_link_libraries(zcore_device PUBLIC SingZ::zcore_audio Threads::Threads)
-if(DEFINED SINGZ_CORE_TESTS AND SINGZ_CORE_TESTS)
+if(AUDIOZ_BUILD_TESTS OR (DEFINED SINGZ_CORE_TESTS AND SINGZ_CORE_TESTS))
   target_compile_definitions(zcore_device PRIVATE SINGZ_CORE_TESTS=1)
 endif()
 if(WIN32)
@@ -140,6 +147,12 @@ elseif(APPLE)
   if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     target_link_libraries(zcore_device PUBLIC "-framework AVFoundation")
   endif()
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  find_package(ALSA REQUIRED)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(UDEV REQUIRED IMPORTED_TARGET libudev)
+  target_compile_definitions(zcore_device PRIVATE SINGZ_HAS_ALSA=1)
+  target_link_libraries(zcore_device PUBLIC ALSA::ALSA PkgConfig::UDEV)
 endif()
 
 add_library(zdsp_api INTERFACE)
@@ -395,3 +408,14 @@ foreach(_target IN LISTS _audioz_targets)
     add_dependencies("${_target}" singz_check_zcore_boundaries)
   endif()
 endforeach()
+
+if(AUDIOZ_BUILD_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+  add_executable(audio_host_linux_tests tests/native/audio_host_linux_tests.cpp)
+  target_compile_features(audio_host_linux_tests PRIVATE cxx_std_20)
+  target_compile_definitions(audio_host_linux_tests PRIVATE SINGZ_CORE_TESTS=1)
+  target_include_directories(audio_host_linux_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+  target_link_libraries(audio_host_linux_tests PRIVATE SingZ::zcore_device Threads::Threads)
+  add_dependencies(audio_host_linux_tests singz_check_zcore_boundaries)
+  add_test(NAME audio_host_linux_tests COMMAND audio_host_linux_tests)
+  set_tests_properties(audio_host_linux_tests PROPERTIES TIMEOUT 30)
+endif()
