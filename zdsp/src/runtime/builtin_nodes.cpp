@@ -412,13 +412,17 @@ void limitPlane(const float *source, float *destination, uint32_t frames, float 
     const auto high = _mm_cvtps_pd(_mm_movehl_ps(value, value));
     lowEnergy = _mm_add_pd(lowEnergy, _mm_mul_pd(low, low));
     highEnergy = _mm_add_pd(highEnergy, _mm_mul_pd(high, high));
-    // Conditional selects preserve the scalar path's signed zero, including
-    // a zero threshold; min/max would replace an equal operand's encoding.
-    const auto above = _mm_cmpgt_ps(value, upper);
-    const auto clipped = _mm_or_ps(_mm_and_ps(above, upper), _mm_andnot_ps(above, value));
-    const auto below = _mm_cmplt_ps(clipped, lower);
-    _mm_storeu_ps(destination + frame,
-                  _mm_or_ps(_mm_and_ps(below, lower), _mm_andnot_ps(below, clipped)));
+    // The caller restricts SSE2 traversal to ordinary IEEE mode. Positive
+    // bounds preserve signed zero; zero bounds require conditional selects.
+    if (threshold > 0.0f) {
+      _mm_storeu_ps(destination + frame, _mm_min_ps(_mm_max_ps(value, lower), upper));
+    } else {
+      const auto above = _mm_cmpgt_ps(value, upper);
+      const auto clipped = _mm_or_ps(_mm_and_ps(above, upper), _mm_andnot_ps(above, value));
+      const auto below = _mm_cmplt_ps(clipped, lower);
+      _mm_storeu_ps(destination + frame,
+                    _mm_or_ps(_mm_and_ps(below, lower), _mm_andnot_ps(below, clipped)));
+    }
   }
   float peaks[4];
   double energies[4];
@@ -477,7 +481,14 @@ void limitPlane(const float *source, float *destination, uint32_t frames, float 
 
 void processLimiter(BuiltinState *state, const ProcessContext *context,
                     const ConstAudioBusView *inputs, const MutableAudioBusView &output) noexcept {
-  if (context->parameterCount == 0 && state->rampRemaining == 0) {
+  bool ordinaryFloatingPoint = true;
+#if defined(__SSE2__) || defined(_M_X64)
+  // Host FTZ/DAZ can change the compiler's scalar subnormal semantics. Retain
+  // that exact path in nondefault modes, without modifying the host's MXCSR.
+  constexpr uint32_t flushToZero = 0x8000, denormalsAreZero = 0x0040;
+  ordinaryFloatingPoint = (_mm_getcsr() & (flushToZero | denormalsAreZero)) == 0;
+#endif
+  if (context->parameterCount == 0 && state->rampRemaining == 0 && ordinaryFloatingPoint) {
     LimiterTotals totals;
     if (output.frames.value != 0)
       for (uint32_t channel = 0; channel < output.channelCount; ++channel)

@@ -7,6 +7,71 @@
 #include <cstdio>
 #include <limits>
 
+namespace {
+void checkLimiterHostModes() {
+    using namespace zdsp;
+    const auto check = [] {
+        constexpr std::array<uint32_t, 8> encodings{
+            1, 0x80000001U, 0x007fffffU, 0x807fffffU, 0, 0x80000000U, 0x3f800000U, 0xbf800000U};
+        for (float threshold : {0.0f, 0.5f, std::numeric_limits<float>::denorm_min(),
+                                std::numeric_limits<float>::min()}) {
+            std::array<float, 8> source{}, actual{}, expected{};
+            for (size_t i = 0; i < source.size(); ++i)
+                source[i] = std::bit_cast<float>(encodings[i]);
+            const float* read = source.data();
+            float* write = actual.data();
+            float* reference = expected.data();
+            ConstAudioBusView in{&read, 1, {8}, {8}, nullptr};
+            MutableAudioBusView out{&write, 1, {8}, {8}}, ref{&reference, 1, {8}, {8}};
+            BuiltinState a{}, b{};
+            a.config.node = b.config.node = {1};
+            a.config.kind = b.config.kind = BuiltinNodeKind::SafetyLimiter;
+            a.currentValue = b.currentValue = threshold;
+            ProcessContext context{};
+            context.frames = {8};
+            // Prevent the compiler from specializing calls across mode changes.
+            auto* volatile process = &processLimiter;
+            process(&a, &context, &in, out);
+            ParameterEvent unrelated{};
+            unrelated.node = {2};
+            context.parameters = &unrelated;
+            context.parameterCount = 1;
+            process(&b, &context, &in, ref);
+            for (size_t i = 0; i < actual.size(); ++i)
+                assert(std::bit_cast<uint32_t>(actual[i]) == std::bit_cast<uint32_t>(expected[i]));
+            const auto meter = builtinMeter({&a, &kFunctions});
+            const auto referenceMeter = builtinMeter({&b, &kFunctions});
+            assert(meter.frames == referenceMeter.frames && meter.peak == referenceMeter.peak);
+            assert(std::abs(meter.rms - referenceMeter.rms) <=
+                   2 * std::numeric_limits<float>::epsilon() * std::max(1.f, referenceMeter.rms));
+        }
+    };
+#if defined(__SSE2__) || defined(_M_X64)
+    const auto original = _mm_getcsr();
+    for (uint32_t mode : {0U, 0x8000U, 0x0040U, 0x8040U}) {
+        _mm_setcsr((original & ~0x8040U) | mode);
+        check();
+    }
+    _mm_setcsr(original);
+    assert(_mm_getcsr() == original);
+#elif defined(__aarch64__)
+    uint64_t original;
+    asm volatile("mrs %0, fpcr" : "=r"(original));
+    for (uint64_t mode : {uint64_t(0), uint64_t(1) << 24}) {
+        const auto control = (original & ~(uint64_t(1) << 24)) | mode;
+        asm volatile("msr fpcr, %0\n\tisb" : : "r"(control) : "memory");
+        check();
+    }
+    asm volatile("msr fpcr, %0\n\tisb" : : "r"(original) : "memory");
+    uint64_t restored;
+    asm volatile("mrs %0, fpcr" : "=r"(restored));
+    assert(restored == original);
+#else
+    check();
+#endif
+}
+} // namespace
+
 int main() {
     using namespace zdsp;
     // Independent CRT oracle: changing the common helper also changes both
@@ -165,5 +230,6 @@ int main() {
         const auto meter = builtinMeter({&state, &kFunctions});
         assert(meter.peak == 1.f && meter.rms == 1.f && meter.frames == 6);
     }
+    checkLimiterHostModes();
     std::printf("SingZ planar builtins: %u exact output/diagnostic comparisons passed\n", cases);
 }
