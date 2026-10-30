@@ -16,6 +16,7 @@
     "cmake/TestIosAudioHostRealtimePolicy.cmake",
     "cmake/TestPlaybackRealtimePolicy.cmake",
     "cmake/TestZcoreRealtimePolicy.cmake",
+    "tests/native/audio_host_ios_link_smoke.cpp",
     "third_party/native/dr_mp3/README.md",
     "third_party/native/dr_mp3/dr_mp3.h",
     "third_party/native/flac/COPYING.Xiph",
@@ -189,6 +190,7 @@
     "zdsp/README.md",
     "zdsp/benchmarks/fake_host_benchmark.cpp",
     "zdsp/benchmarks/graph_benchmark.cpp",
+    "zdsp/benchmarks/singz_builtin_benchmark.cpp",
     "zdsp/build-apple-component-smoke.sh",
     "zdsp/include/zdsp/analysis/capture_adapter.h",
     "zdsp/include/zdsp/analysis/crepe_tiny.h",
@@ -215,7 +217,6 @@
     "zdsp/include/zdsp/scheduled_gain.h",
     "zdsp/include/zdsp/streaming_window_source.h",
     "zdsp/include/zdsp/types.h",
-    "zdsp/run-sanitizer-gates.sh",
     "zdsp/src/analysis/capture_adapter.cpp",
     "zdsp/src/analysis/crepe_tiny.cpp",
     "zdsp/src/analysis/live_input_analyzer.cpp",
@@ -237,6 +238,8 @@
     "zdsp/tests/allocation_trap.cpp",
     "zdsp/tests/allocation_trap.h",
     "zdsp/tests/audio_host_graph_adapter_tests.cpp",
+    "zdsp/tests/singz_containment_tests.cpp",
+    "zdsp/tests/singz_planar_tests.cpp",
     "zdsp/tests/streaming_window_source_tests.cpp",
     "zdsp/tests/zdsp_analysis_tests.cpp",
     "zdsp/tests/zdsp_contract_tests.cpp",
@@ -368,12 +371,44 @@
     "zcore/platform/ios/audio_host_ios_session_signals.h"
   ],
   "packageFiles": [
+    ".github/workflows/audioz.yml",
     ".gitignore",
     "CMakeLists.txt",
     "README.md",
     "audioz-source-manifest.json",
     "scripts/import-audioz.py",
+    "scripts/test-import-audioz.py",
     "scripts/verify-audioz.py",
+    "tests/native/audio_host_ios_link_smoke.cpp",
     "third_party/native/CMakeLists.txt"
-  ]
+  ],
+  "optimizationProvenance": {
+    "kind": "post-extraction shared runtime optimization",
+    "date": "2026-10-30",
+    "source": "LoopZ generated containment and planar overlays, reviewed as a separate phase",
+    "graphRunnerSha256": "91a1ca4bcc7c8fbaeac5cec11bcc5a65675bdeab12974fcd790c5ee93f55cfae",
+    "builtinNodesSha256": "39a7bc404ff466e4316644d43e974750dae2789db59e5c1f2ada8b6dedc4e119",
+    "scope": [
+      "batched scalar containment with existing SSE2 path",
+      "IEEE finite-bit classification",
+      "idle gain plane traversal"
+    ],
+    "excluded": [
+      "limiter fast path; preserve existing pre-limit meter behavior"
+    ]
+  },
+  "testComponents": {
+    "containment": [
+      "zdsp/tests/singz_containment_tests.cpp"
+    ],
+    "planarBuiltins": [
+      "zdsp/tests/singz_planar_tests.cpp"
+    ],
+    "iosAudioHostLinkSmoke": [
+      "tests/native/audio_host_ios_link_smoke.cpp"
+    ],
+    "importer": [
+      "scripts/test-import-audioz.py"
+    ]
+  }
 }

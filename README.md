@@ -1,8 +1,11 @@
 # AudioZ
 
-AudioZ is the shared C++20 audio runtime extracted from SingZ. The extracted
-engine source baseline is SingZ revision `ac620fb0`; source bytes in this package
-remain unchanged from that revision. LoopZ consumes this latest common baseline.
+AudioZ is the shared C++20 audio runtime extracted from SingZ. The extracted engine source baseline is SingZ revision `ac620fb0`. Two runtime
+translation units have a separately reviewed optimization layer, documented by
+`optimizationProvenance` in the source manifest: graph sample containment and
+idle gain traversal. Finite classification preserves exact finite bit patterns;
+Limiter traversal remains unchanged so pre-limit telemetry keeps its current
+meaning. Other extracted engine source bytes match the baseline.
 The package has no root license grant beyond the upstream terms retained beside
 third-party code. Its public CMake
 targets retain the `SingZ::` names used by existing consumers and also expose
@@ -30,6 +33,13 @@ Every package import is generated from an exact full Git commit with
 `scripts/import-audioz.py`; `scripts/verify-audioz.py` checks the snapshot lock,
 including the complete tracked package tree, manifest, build files and scripts.
 `audioz-source-manifest.json` enumerates extracted component source ownership.
+The lower-level `zcore/README.md` and `zdsp/README.md` retain technical design
+history from SingZ; their platform packaging and phase-status notes describe
+that application and are not AudioZ build instructions.
+
+`zdsp/run-sanitizer-gates.sh` stays with SingZ because it invokes application
+presets and product-only tests. AudioZ exposes the reusable graph, containment,
+planar and analysis tests directly through CTest.
 
 The FLAC and dr_mp3 source inputs retain their upstream notices in
 `third_party/native/flac` and `third_party/native/dr_mp3`. The optional
