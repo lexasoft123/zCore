@@ -1,9 +1,11 @@
 // Compare the generated steady-state traversal with its upstream automation path.
 #include "../src/runtime/builtin_nodes.cpp"
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cassert>
 #include <cstdio>
+#include <limits>
 
 int main() {
     using namespace zdsp;
@@ -33,45 +35,135 @@ int main() {
     uint32_t cases = 0;
     for (const bool limiter : {false, true})
         for (const auto channels : {1U, 2U, 8U, 64U})
-            for (const auto frames : {0U, 1U, 7U, 128U, 256U})
+            for (const auto frames : {0U, 1U, 3U, 4U, 5U, 7U, 32U, 64U, 128U, 256U})
                 for (const auto initial : {0U, UINT32_MAX - 3, UINT32_MAX})
-                    for (const float value : {0.0f, 0.5f, 0.98f, 2.0f}) {
-                        std::array<std::array<float, 256>, 64> input{}, actual{}, expected{};
-                        std::array<const float*, 64> read{};
-                        std::array<float*, 64> write{}, reference{};
-                        for (uint32_t channel = 0; channel < channels; ++channel) {
-                            read[channel] = input[channel].data();
-                            write[channel] = actual[channel].data();
-                            reference[channel] = expected[channel].data();
-                            for (uint32_t frame = 0; frame < 256; ++frame)
-                                input[channel][frame] = std::bit_cast<float>(
-                                    patterns[(frame + channel) % patterns.size()]);
+                    for (const float value : {0.0f, 0.5f, 0.98f, 2.0f})
+                        for (const bool pendingRamp : {false, true}) {
+                            std::array<std::array<float, 256>, 64> input{}, actual{}, expected{};
+                            std::array<const float *, 64> read{};
+                            std::array<float *, 64> write{}, reference{};
+                            for (uint32_t channel = 0; channel < channels; ++channel) {
+                                read[channel] = input[channel].data();
+                                write[channel] = actual[channel].data();
+                                reference[channel] = expected[channel].data();
+                                for (uint32_t frame = 0; frame < 256; ++frame)
+                                    input[channel][frame] = std::bit_cast<float>(
+                                        patterns[(frame + channel) % patterns.size()]);
+                            }
+                            BuiltinState a{}, b{};
+                            a.config.node = b.config.node = {1};
+                            a.currentValue = b.currentValue = value;
+                            a.nonFinite = b.nonFinite = initial;
+                            if (pendingRamp) {
+                                a.rampTarget = b.rampTarget = .25f;
+                                a.rampStep = b.rampStep = (.25f - value) / 5;
+                                a.rampRemaining = b.rampRemaining = 5;
+                            }
+                            ConstAudioBusView in{read.data(), channels, {frames}, {256}, nullptr};
+                            MutableAudioBusView out{write.data(), channels, {frames}, {256}};
+                            MutableAudioBusView ref{reference.data(), channels, {frames}, {256}};
+                            ProcessContext context{};
+                            context.frames = {frames};
+                            const auto process = limiter ? processLimiter : processGain;
+                            process(&a, &context, &in, out);
+                            // An event for another node selects the unchanged upstream
+                            // loop without altering this processor's gain or threshold.
+                            ParameterEvent unrelated{};
+                            unrelated.node = {2};
+                            context.parameters = &unrelated;
+                            context.parameterCount = 1;
+                            process(&b, &context, &in, ref);
+                            assert(a.nonFinite == b.nonFinite);
+                            assert(a.currentValue == b.currentValue);
+                            assert(a.rampRemaining == b.rampRemaining);
+                            if (limiter) {
+                                const auto fast = builtinMeter({&a, &kFunctions});
+                                const auto referenceMeter = builtinMeter({&b, &kFunctions});
+                                assert(fast.frames == frames && referenceMeter.frames == frames);
+                                assert(std::bit_cast<uint32_t>(fast.peak) ==
+                                       std::bit_cast<uint32_t>(referenceMeter.peak));
+                                // Independent double SIMD sums may associate positive
+                                // squares differently; final RMS retains float precision (relative
+                                // epsilon bound).
+                                const auto scale =
+                                    std::max(double(fast.rms), double(referenceMeter.rms));
+                                assert(std::isfinite(fast.rms) &&
+                                       std::isfinite(referenceMeter.rms));
+                                assert(std::abs(double(fast.rms) - referenceMeter.rms) <=
+                                       2 * std::numeric_limits<float>::epsilon() * scale);
+                            }
+                            for (uint32_t channel = 0; channel < channels; ++channel)
+                                for (uint32_t frame = 0; frame < 256; ++frame)
+                                    assert(std::bit_cast<uint32_t>(actual[channel][frame]) ==
+                                           std::bit_cast<uint32_t>(expected[channel][frame]));
+                            ++cases;
                         }
-                        BuiltinState a{}, b{};
-                        a.config.node = b.config.node = {1};
-                        a.currentValue = b.currentValue = value;
-                        a.nonFinite = b.nonFinite = initial;
-                        ConstAudioBusView in{read.data(), channels, {frames}, {256}, nullptr};
-                        MutableAudioBusView out{write.data(), channels, {frames}, {256}};
-                        MutableAudioBusView ref{reference.data(), channels, {frames}, {256}};
-                        ProcessContext context{};
-                        context.frames = {frames};
-                        const auto process = limiter ? processLimiter : processGain;
-                        process(&a, &context, &in, out);
-                        // An event for another node selects the unchanged upstream
-                        // loop without altering this processor's gain or threshold.
-                        ParameterEvent unrelated{};
-                        unrelated.node = {2};
-                        context.parameters = &unrelated;
-                        context.parameterCount = 1;
-                        process(&b, &context, &in, ref);
-                        assert(a.nonFinite == b.nonFinite);
-                        assert(a.currentValue == b.currentValue);
-                        for (uint32_t channel = 0; channel < channels; ++channel)
-                            for (uint32_t frame = 0; frame < 256; ++frame)
-                                assert(std::bit_cast<uint32_t>(actual[channel][frame]) ==
-                                       std::bit_cast<uint32_t>(expected[channel][frame]));
-                        ++cases;
-                    }
+    // A separate finite-input oracle catches accidentally metering the clipped
+    // output, and covers in-place processing, nonfinite containment and -0.
+    {
+        std::array<float, 8> samples{-2.f,
+                                     3.f,
+                                     .25f,
+                                     -0.f,
+                                     std::numeric_limits<float>::infinity(),
+                                     std::numeric_limits<float>::quiet_NaN(),
+                                     -1.f,
+                                     .5f};
+        const auto input = samples;
+        const float *read = samples.data();
+        float *write = samples.data();
+        ConstAudioBusView in{&read, 1, {8}, {8}, nullptr};
+        MutableAudioBusView out{&write, 1, {8}, {8}};
+        BuiltinState state{};
+        state.config.kind = BuiltinNodeKind::SafetyLimiter;
+        state.currentValue = .5f;
+        state.nonFinite = UINT32_MAX - 1;
+        ProcessContext context{};
+        context.frames = {8};
+        processLimiter(&state, &context, &in, out);
+        double energy = 0;
+        for (uint32_t i = 0; i < samples.size(); ++i) {
+            const auto finite = std::isfinite(input[i]) ? input[i] : 0.f;
+            energy += double(finite) * finite;
+            float expected = finite;
+            if (expected > .5f)
+                expected = .5f;
+            if (expected < -.5f)
+                expected = -.5f;
+            assert(std::bit_cast<uint32_t>(samples[i]) == std::bit_cast<uint32_t>(expected));
+        }
+        const auto meter = builtinMeter({&state, &kFunctions});
+        assert(meter.peak == 3.f && meter.frames == 8 && state.nonFinite == UINT32_MAX);
+        assert(std::abs(double(meter.rms) - std::sqrt(energy / samples.size())) < 1e-6);
+    }
+    // A real threshold ramp must retain frame-exact automation and meter the
+    // unchanged input rather than the progressively clipped output.
+    {
+        std::array<float, 6> source{1, 1, 1, 1, 1, 1}, output{};
+        const float *read = source.data();
+        float *write = output.data();
+        ConstAudioBusView in{&read, 1, {6}, {6}, nullptr};
+        MutableAudioBusView out{&write, 1, {6}, {6}};
+        BuiltinState state{};
+        state.config.node = {1};
+        state.config.kind = BuiltinNodeKind::SafetyLimiter;
+        state.currentValue = .5f;
+        ParameterEvent event{};
+        event.node = {1};
+        event.parameter = kLimiterThresholdParameter;
+        event.sampleOffset = {2};
+        event.value = .25f;
+        event.curve = ParameterCurve::Linear;
+        event.rampFrames = {2};
+        ProcessContext context{};
+        context.frames = {6};
+        context.parameters = &event;
+        context.parameterCount = 1;
+        processLimiter(&state, &context, &in, out);
+        const std::array<float, 6> expected{.5f, .5f, .5f, .375f, .25f, .25f};
+        assert(output == expected && state.rampRemaining == 0 && state.currentValue == .25f);
+        const auto meter = builtinMeter({&state, &kFunctions});
+        assert(meter.peak == 1.f && meter.rms == 1.f && meter.frames == 6);
+    }
     std::printf("SingZ planar builtins: %u exact output/diagnostic comparisons passed\n", cases);
 }
