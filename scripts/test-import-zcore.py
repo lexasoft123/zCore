@@ -29,7 +29,10 @@ def main():
         tool = repo / "scripts/run.sh"; tool.write_text("#!/bin/sh\nexit 0\n"); tool.chmod(0o755)
         manifest = {"schemaVersion": 1, "package": "zCore", "paths": ["src/engine.cpp"]}
         (repo / "zcore-source-manifest.json").write_text(json.dumps(manifest) + "\n")
-        git(repo, "init", "-q"); git(repo, "add", "-A"); git(repo, "-c", "user.name=zCore test", "-c", "user.email=test@example.invalid", "commit", "-qm", "fixture")
+        git(repo, "init", "-q"); git(repo, "add", "-A")
+        # Git records executable intent even on filesystems without POSIX modes.
+        git(repo, "update-index", "--chmod=+x", "--", "scripts/run.sh")
+        git(repo, "-c", "user.name=zCore test", "-c", "user.email=test@example.invalid", "commit", "-qm", "fixture")
         revision = git(repo, "rev-parse", "HEAD")
         # A dirty source worktree must not affect the exported committed snapshot.
         (repo / "src/engine.cpp").write_text("mutable, uncommitted change\n")
@@ -38,7 +41,8 @@ def main():
                 "--destination", str(dest), "--lock", str(lock), "--repository-url", "test://zcore")
         run(*args)
         assert (dest / "src/engine.cpp").read_text() == "immutable engine source\n"
-        assert (dest / "scripts/run.sh").stat().st_mode & 0o111
+        if os.name != "nt":
+            assert (dest / "scripts/run.sh").stat().st_mode & 0o111
         record = json.loads(lock.read_text())
         assert record["revision"] == revision and record["repository"] == "test://zcore"
         assert hashlib.sha256((dest / "zcore-source-manifest.json").read_bytes()).hexdigest() == record["manifestSha256"]
