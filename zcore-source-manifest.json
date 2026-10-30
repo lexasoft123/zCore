@@ -387,7 +387,7 @@
     "date": "2026-10-30",
     "source": "LoopZ generated containment and planar overlays, reviewed as a separate phase",
     "graphRunnerSha256": "91a1ca4bcc7c8fbaeac5cec11bcc5a65675bdeab12974fcd790c5ee93f55cfae",
-    "builtinNodesSha256": "1b3d97b20d07b139f87354ada9b6b65b39033ced57ebde0cca082d90fd556af1",
+    "builtinNodesSha256": "fe72c47e716fe72717e4e4073173e24f4ec4acc3ce0c73d05177a4248c54b7e0",
     "scope": [
       "batched scalar containment with existing SSE2 path",
       "IEEE finite-bit classification",
