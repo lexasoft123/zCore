@@ -1,4 +1,4 @@
-name: AudioZ
+name: zCore
 
 on:
   push:
@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DAUDIOZ_BUILD_MEDIA=ON -DAUDIOZ_BUILD_ANALYSIS=ON -DAUDIOZ_BUILD_TESTS=ON
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DZCORE_BUILD_MEDIA=ON -DZCORE_BUILD_ANALYSIS=ON -DZCORE_BUILD_TESTS=ON
       - name: Build
         run: cmake --build build --config Release --parallel 4
       - name: Test
