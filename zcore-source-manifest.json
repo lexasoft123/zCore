@@ -387,14 +387,16 @@
     "date": "2026-10-30",
     "source": "LoopZ generated containment and planar overlays, reviewed as a separate phase",
     "graphRunnerSha256": "91a1ca4bcc7c8fbaeac5cec11bcc5a65675bdeab12974fcd790c5ee93f55cfae",
-    "builtinNodesSha256": "39a7bc404ff466e4316644d43e974750dae2789db59e5c1f2ada8b6dedc4e119",
+    "builtinNodesSha256": "1b3d97b20d07b139f87354ada9b6b65b39033ced57ebde0cca082d90fd556af1",
     "scope": [
       "batched scalar containment with existing SSE2 path",
       "IEEE finite-bit classification",
-      "idle gain plane traversal"
+      "idle gain plane traversal",
+      "steady limiter traversal with pre-limit peak/RMS telemetry",
+      "baseline SSE2 and AArch64 SIMD with scalar fallback"
     ],
     "excluded": [
-      "limiter fast path; preserve existing pre-limit meter behavior"
+      "automation and active ramps retain sample-accurate scalar traversal"
     ]
   },
   "testComponents": {

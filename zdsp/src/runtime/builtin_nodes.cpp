@@ -6,6 +6,11 @@
 #include <limits>
 #include <limits.h>
 #include <memory>
+#if defined(__SSE2__) || defined(_M_X64)
+#include <emmintrin.h>
+#elif defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 namespace zdsp {
 namespace {
@@ -376,31 +381,141 @@ void processTap(BuiltinState* state, const ConstAudioBusView* inputs,
   endTelemetryWrite(state, slot, odd, next);
 }
 
-void processLimiter(BuiltinState* state, const ProcessContext* context,
-                    const ConstAudioBusView* inputs,
-                    const MutableAudioBusView& output) noexcept {
+struct LimiterTotals {
+  float peak{0};
+  double energy{0};
+  uint64_t invalid{0};
+};
+
+void limitPlane(const float *source, float *destination, uint32_t frames, float threshold,
+                LimiterTotals &totals) noexcept {
+  uint32_t frame = 0;
+#if defined(__SSE2__) || defined(_M_X64)
+  const auto absolute = _mm_set1_epi32(0x7fffffff);
+  const auto infinity = _mm_set1_epi32(0x7f800000);
+  const auto one = _mm_set1_epi32(1);
+  const auto upper = _mm_set1_ps(threshold);
+  const auto lower = _mm_set1_ps(-threshold);
+  auto peak = _mm_setzero_ps();
+  auto lowEnergy = _mm_setzero_pd(), highEnergy = _mm_setzero_pd();
+  auto invalid = _mm_setzero_si128();
+  for (; frames - frame >= 4; frame += 4) {
+    const auto raw = _mm_loadu_ps(source + frame);
+    const auto magnitude = _mm_and_si128(_mm_castps_si128(raw), absolute);
+    const auto finite = _mm_cmpgt_epi32(infinity, magnitude);
+    const auto value = _mm_and_ps(raw, _mm_castsi128_ps(finite));
+    invalid = _mm_add_epi32(invalid, _mm_andnot_si128(finite, one));
+    peak = _mm_max_ps(peak, _mm_castsi128_ps(_mm_and_si128(magnitude, finite)));
+    // Meter the finite input, before clipping. Float squares fit exactly in
+    // double; independent lanes remove the scalar accumulation dependency.
+    const auto low = _mm_cvtps_pd(value);
+    const auto high = _mm_cvtps_pd(_mm_movehl_ps(value, value));
+    lowEnergy = _mm_add_pd(lowEnergy, _mm_mul_pd(low, low));
+    highEnergy = _mm_add_pd(highEnergy, _mm_mul_pd(high, high));
+    // Conditional selects preserve the scalar path's signed zero, including
+    // a zero threshold; min/max would replace an equal operand's encoding.
+    const auto above = _mm_cmpgt_ps(value, upper);
+    const auto clipped = _mm_or_ps(_mm_and_ps(above, upper), _mm_andnot_ps(above, value));
+    const auto below = _mm_cmplt_ps(clipped, lower);
+    _mm_storeu_ps(destination + frame,
+                  _mm_or_ps(_mm_and_ps(below, lower), _mm_andnot_ps(below, clipped)));
+  }
+  float peaks[4];
+  double energies[4];
+  uint32_t invalids[4];
+  _mm_storeu_ps(peaks, peak);
+  _mm_storeu_pd(energies, lowEnergy);
+  _mm_storeu_pd(energies + 2, highEnergy);
+  _mm_storeu_si128(reinterpret_cast<__m128i *>(invalids), invalid);
+  for (uint32_t lane = 0; lane < 4; ++lane) {
+    if (peaks[lane] > totals.peak)
+      totals.peak = peaks[lane];
+    totals.energy += energies[lane];
+    totals.invalid += invalids[lane];
+  }
+#elif defined(__aarch64__)
+  const auto absolute = vdupq_n_u32(0x7fffffff);
+  const auto infinity = vdupq_n_u32(0x7f800000);
+  const auto upper = vdupq_n_f32(threshold), lower = vdupq_n_f32(-threshold);
+  auto peak = vdupq_n_f32(0);
+  auto lowEnergy = vdupq_n_f64(0), highEnergy = vdupq_n_f64(0);
+  auto invalid = vdupq_n_u32(0);
+  for (; frames - frame >= 4; frame += 4) {
+    const auto raw = vld1q_f32(source + frame);
+    const auto magnitude = vandq_u32(vreinterpretq_u32_f32(raw), absolute);
+    const auto finite = vcltq_u32(magnitude, infinity);
+    const auto value = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(raw), finite));
+    invalid = vaddq_u32(invalid, vandq_u32(vmvnq_u32(finite), vdupq_n_u32(1)));
+    peak = vmaxq_f32(peak, vreinterpretq_f32_u32(vandq_u32(magnitude, finite)));
+    const auto low = vcvt_f64_f32(vget_low_f32(value));
+    const auto high = vcvt_f64_f32(vget_high_f32(value));
+    lowEnergy = vaddq_f64(lowEnergy, vmulq_f64(low, low));
+    highEnergy = vaddq_f64(highEnergy, vmulq_f64(high, high));
+    const auto clipped = vbslq_f32(vcgtq_f32(value, upper), upper, value);
+    vst1q_f32(destination + frame, vbslq_f32(vcltq_f32(clipped, lower), lower, clipped));
+  }
+  totals.peak = std::fmax(totals.peak, vmaxvq_f32(peak));
+  totals.energy += vaddvq_f64(lowEnergy) + vaddvq_f64(highEnergy);
+  // Each lane counts at most ceil(frames / 4), so the per-plane total fits.
+  totals.invalid += vaddvq_u32(invalid);
+#endif
+  for (; frame < frames; ++frame) {
+    const float raw = source[frame];
+    const bool finite = (std::bit_cast<uint32_t>(raw) & 0x7f800000U) != 0x7f800000U;
+    float value = finite ? raw : 0.0f;
+    totals.invalid += !finite;
+    if (std::abs(value) > totals.peak)
+      totals.peak = std::abs(value);
+    totals.energy += static_cast<double>(value) * value;
+    if (value > threshold)
+      value = threshold;
+    if (value < -threshold)
+      value = -threshold;
+    destination[frame] = value;
+  }
+}
+
+void processLimiter(BuiltinState *state, const ProcessContext *context,
+                    const ConstAudioBusView *inputs, const MutableAudioBusView &output) noexcept {
+  if (context->parameterCount == 0 && state->rampRemaining == 0) {
+    LimiterTotals totals;
+    if (output.frames.value != 0)
+      for (uint32_t channel = 0; channel < output.channelCount; ++channel)
+        limitPlane(inputs[0].channels[channel], output.channels[channel], output.frames.value,
+                   state->currentValue, totals);
+    const uint32_t remaining = UINT32_MAX - state->nonFinite;
+    state->nonFinite +=
+        static_cast<uint32_t>(totals.invalid < remaining ? totals.invalid : remaining);
+    const uint64_t count = static_cast<uint64_t>(output.frames.value) * output.channelCount;
+    publishMeter(state, totals.peak,
+                 count == 0 ? 0.0f : static_cast<float>(std::sqrt(totals.energy / count)),
+                 output.frames.value);
+    return;
+  }
   float peak = 0.0f;
   double energy = 0.0;
   uint32_t eventIndex = 0;
   if (context->frames.value == 0)
-    consumeAutomationAt(state, context, 0, kLimiterThresholdParameter,
-                        &eventIndex);
+    consumeAutomationAt(state, context, 0, kLimiterThresholdParameter, &eventIndex);
   for (uint32_t frame = 0; frame < output.frames.value; ++frame) {
-    consumeAutomationAt(state, context, frame, kLimiterThresholdParameter,
-                        &eventIndex);
+    consumeAutomationAt(state, context, frame, kLimiterThresholdParameter, &eventIndex);
     const float threshold = state->currentValue;
     for (uint32_t channel = 0; channel < output.channelCount; ++channel) {
       float value = finiteSample(inputs[0].channels[channel][frame], state);
-      if (std::abs(value) > peak) peak = std::abs(value);
+      if (std::abs(value) > peak)
+        peak = std::abs(value);
       energy += static_cast<double>(value) * value;
-      if (value > threshold) value = threshold;
-      if (value < -threshold) value = -threshold;
+      if (value > threshold)
+        value = threshold;
+      if (value < -threshold)
+        value = -threshold;
       output.channels[channel][frame] = value;
     }
     advanceAutomation(state);
   }
   const uint64_t count = static_cast<uint64_t>(output.frames.value) * output.channelCount;
-  publishMeter(state, peak, count == 0 ? 0.0f : static_cast<float>(std::sqrt(energy / count)), output.frames.value);
+  publishMeter(state, peak, count == 0 ? 0.0f : static_cast<float>(std::sqrt(energy / count)),
+               output.frames.value);
 }
 
 void process(void* opaque, const ProcessContext* context,
