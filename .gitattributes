@@ -1,0 +1,2 @@
+# Keep native source and shell scripts byte-identical on all platforms.
+* -text
