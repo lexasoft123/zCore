@@ -82,13 +82,17 @@ std::unique_ptr<AlsaCaptureLease> acquireAlsaCapture(
     uint32_t rate, uint32_t period, AlsaCapturePush push, void* context,
     std::string& error);
 
+enum class AlsaOutputRecoveryOperation { Prepare, Write, Start };
 #if defined(SINGZ_CORE_TESTS)
 using AlsaWriteForTest = snd_pcm_sframes_t (*)(void*, const void*, snd_pcm_uframes_t);
+using AlsaOutputRecoveryForTest = snd_pcm_sframes_t (*)(
+    void*, AlsaOutputRecoveryOperation, const void*, snd_pcm_uframes_t);
 // Named ALSA plugins are allowed only at this private test seam. Production
 // resolves opaque inventory UIDs to direct hardware endpoints.
 std::unique_ptr<AudioHostBackend> makeAlsaAudioHostForTests(
     std::string outputPcm, std::string inputPcm = {},
-    AlsaWriteForTest write = nullptr, void* writeContext = nullptr);
+    AlsaWriteForTest write = nullptr, void* writeContext = nullptr,
+    AlsaOutputRecoveryForTest recover = nullptr);
 #endif
 
 }  // namespace singz::detail

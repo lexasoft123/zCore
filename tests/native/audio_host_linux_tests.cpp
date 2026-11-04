@@ -123,11 +123,25 @@ void lifecycle() {
   CHECK(!real.open(config("alsa:missing"), Render::run, &observer).ok);
 }
 struct ShortWrites {
-  uint64_t frame{0};
-  uint32_t calls{0}, interrupted{0};
-  bool invalid{false};
+  using Operation = detail::AlsaOutputRecoveryOperation;
+  uint64_t frame{0}, failureFrame{4096}, primed{0};
+  uint32_t calls{0}, interrupted{0}, recoveryBlocks{0};
+  uint32_t recoveryPrepares{0}, recoveryWrites{0}, recoveryStarts{0};
+  bool invalid{false}, oneShot{false}, injected{false};
+  bool failRestart{false};
   int failure{-EPIPE};
-  static bool render(void*, const AudioHostRenderBlock& block) noexcept {
+  Operation restartFailureOperation{Operation::Prepare};
+  snd_pcm_sframes_t restartFailure{-EIO};
+  static bool render(void* context, const AudioHostRenderBlock& block) noexcept {
+    auto& self = *static_cast<ShortWrites*>(context);
+    const auto discontinuity = block.discontinuity &
+        (AudioHostDiscontinuityXRun | AudioHostDiscontinuityClockReanchored);
+    if (discontinuity) {
+      ++self.recoveryBlocks;
+      if (discontinuity != (AudioHostDiscontinuityXRun |
+          AudioHostDiscontinuityClockReanchored))
+        self.invalid = true;
+    }
     for (uint32_t i = 0; i < block.frames; ++i) {
       block.output[0][i] = float((block.outputFrame + i) % 251) / 512;
       block.output[1][i] = -.25f;
@@ -139,7 +153,10 @@ struct ShortWrites {
     ++self.calls;
     if (self.calls % 7 == 0) { ++self.interrupted; return -EINTR; }
     if (self.calls % 5 == 0) { ++self.interrupted; return -EAGAIN; }
-    if (self.frame >= 4096) return self.failure;
+    if (self.frame >= self.failureFrame && (!self.oneShot || !self.injected)) {
+      self.injected = true;
+      return self.failure;
+    }
     const uint32_t accepted = uint32_t(std::min<snd_pcm_uframes_t>(13, frames));
     const auto* bytes = static_cast<const unsigned char*>(data);
     for (uint32_t i = 0; i < accepted; ++i) {
@@ -152,19 +169,83 @@ struct ShortWrites {
     self.frame += accepted;
     return accepted;
   }
+  static snd_pcm_sframes_t recover(void* context, Operation operation,
+      const void* data, snd_pcm_uframes_t frames) {
+    auto& self = *static_cast<ShortWrites*>(context);
+    if (operation == Operation::Prepare) ++self.recoveryPrepares;
+    if (operation == Operation::Write) ++self.recoveryWrites;
+    if (operation == Operation::Start) ++self.recoveryStarts;
+    if (self.failRestart && self.restartFailureOperation == operation)
+      return self.restartFailure;
+    if (operation != Operation::Write) return 0;
+    const auto* bytes = static_cast<const unsigned char*>(data);
+    if (!bytes || !frames) self.invalid = true;
+    for (size_t i = 0; i < size_t(frames) * 8; ++i)
+      if (bytes[i] != 0) self.invalid = true;
+    const auto accepted = std::min<snd_pcm_uframes_t>(13, frames);
+    self.primed += accepted;
+    return accepted;
+  }
 };
 void shortTransfers() {
-  for (const int failure : {-EPIPE, -ENODEV, 0}) {
+  for (const int failure : {-ENODEV, 0, -ESTRPIPE, std::numeric_limits<int>::max()}) {
     ShortWrites observed; observed.failure = failure;
     AudioHost host(detail::makeAlsaAudioHostForTests("null", {}, ShortWrites::write, &observed));
-    CHECK(host.open(config(), ShortWrites::render, nullptr).ok && host.start().ok);
+    CHECK(host.open(config(), ShortWrites::render, &observed).ok && host.start().ok);
     const auto expected = failure == -ENODEV ? AudioHostState::DeviceLost : AudioHostState::Error;
     CHECK(until([&] { return host.status().state == expected; }));
-    CHECK(host.status().xruns == uint64_t(failure == -EPIPE));
+    CHECK(host.status().xruns == uint64_t(failure == -ESTRPIPE));
     CHECK(host.status().terminalReason == (failure == -ENODEV ?
         AudioHostTerminalReason::DeviceLost : AudioHostTerminalReason::ProviderFailure));
     host.stop();
     CHECK(!observed.invalid && observed.frame >= 4096 && observed.interrupted > 0);
+  }
+}
+void recoveredUnderrun() {
+  ShortWrites observed;
+  observed.oneShot = true;
+  observed.failureFrame = 4109;
+  AudioHost host(detail::makeAlsaAudioHostForTests(
+      "null", {}, ShortWrites::write, &observed, ShortWrites::recover));
+  CHECK(host.open(config(), ShortWrites::render, &observed).ok);
+  const auto buffer = host.status().diagnostics.outputBufferFrames;
+  CHECK(host.start().ok);
+  CHECK(until([&] { return host.status().xruns == 1 && host.status().callbacks >= 20; }));
+  CHECK(host.status().state == AudioHostState::Running);
+  CHECK(host.status().terminalReason == AudioHostTerminalReason::None);
+  CHECK(host.status().xruns == 1);
+  host.stop();
+  CHECK(observed.injected && observed.frame > observed.failureFrame);
+  CHECK(observed.recoveryBlocks == 1);
+  CHECK(observed.recoveryPrepares == 1 && observed.recoveryStarts == 1);
+  CHECK(observed.recoveryWrites == (buffer + 12) / 13 && observed.primed == buffer);
+  CHECK(!observed.invalid && observed.interrupted > 0);
+}
+void recoveryFailures() {
+  for (const auto operation : {ShortWrites::Operation::Prepare,
+       ShortWrites::Operation::Write, ShortWrites::Operation::Start}) {
+    ShortWrites observed;
+    observed.oneShot = true;
+    observed.failureFrame = 4109;
+    observed.failRestart = true;
+    observed.restartFailureOperation = operation;
+    observed.restartFailure = operation == ShortWrites::Operation::Write ? 0 : -EIO;
+    AudioHost host(detail::makeAlsaAudioHostForTests(
+        "null", {}, ShortWrites::write, &observed, ShortWrites::recover));
+    CHECK(host.open(config(), ShortWrites::render, &observed).ok);
+    const auto buffer = host.status().diagnostics.outputBufferFrames;
+    CHECK(host.start().ok);
+    CHECK(until([&] { return host.status().state == AudioHostState::Error; }));
+    CHECK(host.status().xruns == 1);
+    CHECK(host.status().terminalReason == AudioHostTerminalReason::ProviderFailure);
+    host.stop();
+    CHECK(observed.injected && observed.recoveryPrepares == 1);
+    const auto expectedWrites = operation == ShortWrites::Operation::Prepare ? 0 :
+        operation == ShortWrites::Operation::Write ? 1 : (buffer + 12) / 13;
+    CHECK(observed.recoveryWrites == expectedWrites);
+    CHECK(observed.recoveryStarts == uint32_t(operation == ShortWrites::Operation::Start));
+    CHECK(observed.primed == (operation == ShortWrites::Operation::Start ? buffer : 0));
+    CHECK(!observed.invalid);
   }
 }
 bool captureCount(void* context, const float*, uint32_t, uint32_t,
@@ -339,7 +420,7 @@ int main(int argc, char** argv) {
   if (argc == 3 && std::string(argv[1]) == "--loopback") loopback(argv[2]);
   else {
     CHECK(argc == 1);
-    conversion(); lifecycle(); shortTransfers(); leases();
-    std::puts("PASS ALSA conversion, lifecycle, failure and bounded capture lease tests");
+    conversion(); lifecycle(); shortTransfers(); recoveredUnderrun(); recoveryFailures(); leases();
+    std::puts("PASS ALSA conversion, lifecycle, failure/recovery and bounded capture lease tests");
   }
 }

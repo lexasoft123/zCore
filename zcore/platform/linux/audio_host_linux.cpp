@@ -87,6 +87,7 @@ class AlsaHost final : public AudioHostBackend {
     output_.resize(size_t(format_.outputChannels) * pcm_.period);
     interleaved_.resize(size_t(pcm_.channels) * pcm_.period);
     bytes_.resize(interleaved_.size() * pcm_.sampleBytes());
+    silence_.assign(bytes_.size(), 0);
     for (uint32_t c = 0; c < format_.outputChannels; ++c)
       outputPointers_[c] = output_.data() + size_t(c) * pcm_.period;
     if (input) {
@@ -117,19 +118,7 @@ class AlsaHost final : public AudioHostBackend {
     std::string error;
     if (capture_ && !capture_->start(error))
       return fail(AudioHostError::ProviderFailure, error);
-    int result = snd_pcm_prepare(pcm_.handle);
-    if (result < 0) return fail(AudioHostError::ProviderFailure, snd_strerror(result));
-    // No render callback during priming. Every physical output starts silent.
-    std::fill(bytes_.begin(), bytes_.end(), 0);
-    snd_pcm_uframes_t written = 0;
-    while (written < pcm_.buffer) {
-      const auto count = snd_pcm_writei(pcm_.handle, bytes_.data(),
-          std::min(snd_pcm_uframes_t(pcm_.period), pcm_.buffer - written));
-      if (count <= 0) return fail(AudioHostError::ProviderFailure,
-          count < 0 ? snd_strerror(int(count)) : "ALSA prefill made no progress");
-      written += snd_pcm_uframes_t(count);
-    }
-    result = snd_pcm_start(pcm_.handle);
+    const int result = restartOutput(false);
     if (result < 0) return fail(AudioHostError::ProviderFailure, snd_strerror(result));
     pcm_.clearWake();
     stopping_.store(false, std::memory_order_release);
@@ -200,6 +189,7 @@ class AlsaHost final : public AudioHostBackend {
 #if defined(SINGZ_CORE_TESTS)
   std::string testOutput_, testInput_;
   detail::AlsaWriteForTest testWrite_{nullptr};
+  detail::AlsaOutputRecoveryForTest testRecovery_{nullptr};
   void* testWriteContext_{nullptr};
 #endif
  private:
@@ -222,6 +212,43 @@ class AlsaHost final : public AudioHostBackend {
     return self.fifo_.writeInterleavedFloat(input, channels,
         self.config_.inputChannels.data(), frames, span, false);
   }
+  snd_pcm_sframes_t outputOperation(bool recovery,
+      detail::AlsaOutputRecoveryOperation operation, const void* data,
+      snd_pcm_uframes_t frames) noexcept {
+#if defined(SINGZ_CORE_TESTS)
+    if (recovery && testRecovery_)
+      return testRecovery_(testWriteContext_, operation, data, frames);
+#else
+    (void)recovery;
+#endif
+    switch (operation) {
+      case detail::AlsaOutputRecoveryOperation::Prepare:
+        return snd_pcm_prepare(pcm_.handle);
+      case detail::AlsaOutputRecoveryOperation::Write:
+        return snd_pcm_writei(pcm_.handle, data, frames);
+      case detail::AlsaOutputRecoveryOperation::Start:
+        return snd_pcm_start(pcm_.handle);
+    }
+    return -EIO;
+  }
+  int restartOutput(bool recovery) noexcept {
+    using Operation = detail::AlsaOutputRecoveryOperation;
+    auto result = outputOperation(recovery, Operation::Prepare, nullptr, 0);
+    if (result < 0) return int(result);
+    // Repriming never renders or touches the pending rendered suffix in bytes_.
+    snd_pcm_uframes_t written = 0;
+    while (written < pcm_.buffer) {
+      const auto requested =
+          std::min(snd_pcm_uframes_t(pcm_.period), pcm_.buffer - written);
+      const auto count =
+          outputOperation(recovery, Operation::Write, silence_.data(), requested);
+      if (count <= 0 || uint64_t(count) > requested)
+        return count < 0 ? int(count) : -EIO;
+      written += snd_pcm_uframes_t(count);
+    }
+    result = outputOperation(recovery, Operation::Start, nullptr, 0);
+    return int(result);
+  }
   void terminal(int error) noexcept {
     error_.store(error, std::memory_order_release);
     if (error == -EPIPE || error == -ESTRPIPE)
@@ -234,18 +261,39 @@ class AlsaHost final : public AudioHostBackend {
     // Drop queued playback on a terminal error. No drain or auto-resume.
     snd_pcm_drop(pcm_.handle);
   }
+  bool handleOutputFailure(int error) noexcept {
+    if (error != -EPIPE) {
+      terminal(error);
+      return false;
+    }
+    xruns_.fetch_add(1, std::memory_order_relaxed);
+    const int recovered = restartOutput(true);
+    if (recovered < 0) {
+      terminal(recovered);
+      return false;
+    }
+    nextDiscontinuity_ |= AudioHostDiscontinuityXRun |
+        AudioHostDiscontinuityClockReanchored;
+    return true;
+  }
   void run() noexcept {
     uint32_t pending = 0, offset = 0;
     while (!stopping_.load(std::memory_order_acquire)) {
       if (capture_ && capture_->failure()) { terminal(capture_->failure()); break; }
       const int ready = pcm_.wait();
       if (stopping_.load(std::memory_order_acquire)) break;
-      if (ready < 0) { terminal(ready); break; }
+      if (ready < 0) {
+        if (handleOutputFailure(ready)) continue;
+        break;
+      }
       if (!ready) continue;
       if (!pending) {
         const auto available = snd_pcm_avail_update(pcm_.handle);
         if (available == -EAGAIN || available == -EINTR) continue;
-        if (available < 0) { terminal(int(available)); break; }
+        if (available < 0) {
+          if (handleOutputFailure(int(available))) continue;
+          break;
+        }
         if (available < pcm_.period) continue;
         std::fill(output_.begin(), output_.end(), 0);
         AudioHostRenderBlock block;
@@ -298,7 +346,8 @@ class AlsaHost final : public AudioHostBackend {
 #endif
       if (count == -EAGAIN || count == -EINTR) continue;
       if (count <= 0 || uint64_t(count) > pending) {
-        terminal(count < 0 ? int(count) : -EIO); break;
+        if (handleOutputFailure(count < 0 ? int(count) : -EIO)) continue;
+        break;
       }
       // Retain an incompletely written block. Never render its prefix twice.
       offset += uint32_t(count); pending -= uint32_t(count);
@@ -312,7 +361,7 @@ class AlsaHost final : public AudioHostBackend {
   AudioHostRender render_{nullptr}; void* context_{nullptr};
   std::string claimedOutput_;
   std::vector<float> output_, input_, interleaved_;
-  std::vector<unsigned char> bytes_;
+  std::vector<unsigned char> bytes_, silence_;
   std::array<float*, kAudioHostMaxChannels> outputPointers_{}, inputPointers_{};
   std::thread worker_;
   std::atomic<bool> stopping_{true};
@@ -332,10 +381,12 @@ std::unique_ptr<AudioHostBackend> createPlatformAudioHostBackend() {
 namespace detail {
 std::unique_ptr<AudioHostBackend> makeAlsaAudioHostForTests(
     std::string outputPcm, std::string inputPcm,
-    AlsaWriteForTest write, void* writeContext) {
+    AlsaWriteForTest write, void* writeContext,
+    AlsaOutputRecoveryForTest recover) {
   auto host = std::make_unique<AlsaHost>();
   host->testOutput_ = std::move(outputPcm); host->testInput_ = std::move(inputPcm);
   host->testWrite_ = write; host->testWriteContext_ = writeContext;
+  host->testRecovery_ = recover;
   return host;
 }
 }
