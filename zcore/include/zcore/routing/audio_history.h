@@ -36,6 +36,7 @@ struct AudioHistoryReadSnapshot {
 struct AudioHistoryStatus {
     bool online;
     uint32_t availableChannels;
+    // Effective clock anchor, which can differ from the reported callback time.
     uint64_t lastHostNs, callbacks, discontinuities;
     double measuredRate;
 };
@@ -47,10 +48,14 @@ struct AudioHistoryStatus {
 // By default, rate/fractional-clock conversion uses a prepared symmetric bandlimited
 // kernel, so the caller must queue enough history on both sides of the desired
 // timestamp (96 / (0.94 * min(1, outputRate/sourceRate)) source frames). Missing
-// support is reported as missing audio; no hidden timestamp shift is applied.
-// Equal-rate integer-aligned reads use the direct, zero-lookahead path.
+// support is reported as missing audio; resampling never shifts timestamps to
+// conceal absent source frames. Equal-rate aligned reads use the direct path.
 // Past host times use retained callback clock intervals, rather than a newer
 // rate estimate. Stable intervals coalesce only within timestamp precision.
+// Only authoritative continuous source counters may replace an otherwise unusable
+// reported interval with the current measured-rate interval. Correction is bounded
+// at two milliseconds cumulatively; sustained unsupported clocks are not relabeled
+// as nominal. Missing source frames still reset the generation and are never hidden.
 // Diagnostic rate estimates use overlapping half-second observations; the
 // newest interval can extrapolate until its next callback anchor is available.
 // A reader's output clock may also drift within the 0.5% measured-rate bounds.

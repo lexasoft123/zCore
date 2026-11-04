@@ -28,7 +28,14 @@ class SampleClockHistory {
     SampleClockHistory& operator=(const SampleClockHistory&) = delete;
     // Set only when an authoritative source sample counter proves contiguous
     // frames since the preceding anchor. It is not inferred from receipt time.
-    bool append(uint64_t frame, uint64_t hostNs, bool contiguousSourceFrames = false) noexcept;
+    // Valid rates permit only those continuous intervals to replace an otherwise
+    // unusable reported timestamp interval with the measured-rate interval.
+    // Cumulative correction is bounded; a breach requires a valid raw interval
+    // or reset before another interval can be replaced.
+    bool append(uint64_t frame, uint64_t hostNs, bool contiguousSourceFrames = false,
+                double nominalRate = 0, double fallbackRate = 0) noexcept;
+    // Effective timestamp of the newest anchor, including a verified correction.
+    uint64_t lastHostNs() const noexcept;
     void reset() noexcept;
     Snapshot snapshot() const noexcept;
     // fractionNs retains sub-nanosecond output-grid positions. Only the newest

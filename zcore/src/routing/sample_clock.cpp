@@ -9,11 +9,11 @@
 namespace zcore::routing {
 namespace {
 struct Anchor {
-    uint64_t frame{0}, ns{0};
+    uint64_t frame{0}, ns{0}, reportedNs{0};
     bool contiguous{false};
 };
 struct Record {
-    std::atomic<uint64_t> stamp{0}, frame{0}, ns{0};
+    std::atomic<uint64_t> stamp{0}, frame{0}, ns{0}, reportedNs{0};
     std::atomic<bool> contiguous{false};
 };
 bool supportedNominal(double rate) noexcept {
@@ -22,6 +22,7 @@ bool supportedNominal(double rate) noexcept {
 bool supportedMeasured(double rate, double nominal) noexcept {
     return std::isfinite(rate) && rate >= nominal * 0.995 && rate <= nominal * 1.005;
 }
+constexpr uint64_t maximumPhaseCorrectionNs = 2000000;
 double intervalRate(Anchor a, Anchor b, double nominal) noexcept {
     if (b.ns <= a.ns || b.frame <= a.frame)
         return 0;
@@ -52,6 +53,7 @@ struct SampleClockHistory::Impl {
     const uint32_t capacity;
     std::unique_ptr<Record[]> records;
     std::atomic<uint64_t> begin{0}, end{0};
+    bool correctionBlocked{false};
     explicit Impl(uint32_t count) : capacity(count), records(std::make_unique<Record[]>(count)) {}
     bool read(uint64_t ticket, Anchor& result) const noexcept {
         if (ticket == UINT64_MAX)
@@ -59,7 +61,8 @@ struct SampleClockHistory::Impl {
         const auto& record = records[ticket % capacity];
         if (record.stamp.load() != ticket + 1)
             return false;
-        result = {record.frame.load(), record.ns.load(), record.contiguous.load()};
+        result = {record.frame.load(), record.ns.load(), record.reportedNs.load(),
+                  record.contiguous.load()};
         return record.stamp.load() == ticket + 1;
     }
 };
@@ -70,26 +73,67 @@ SampleClockHistory::SampleClockHistory(uint32_t capacity) {
 }
 SampleClockHistory::~SampleClockHistory() = default;
 bool SampleClockHistory::append(uint64_t frame, uint64_t hostNs,
-                                bool contiguousSourceFrames) noexcept {
+                                bool contiguousSourceFrames, double nominalRate,
+                                double fallbackRate) noexcept {
     auto& self = *impl_;
     const auto ticket = self.end.load();
     if (!hostNs || ticket == UINT64_MAX - 1)
         return false;
+    auto mappedNs = hostNs;
     if (ticket > self.begin.load()) {
         Anchor previous;
-        if (!self.read(ticket - 1, previous) || frame <= previous.frame || hostNs <= previous.ns)
+        if (!self.read(ticket - 1, previous) || frame <= previous.frame ||
+            hostNs <= previous.reportedNs)
+            return false;
+        const bool nominalValid = supportedNominal(nominalRate);
+        const bool reportedValid = nominalValid &&
+            intervalRate(previous, {frame, hostNs, hostNs, contiguousSourceFrames}, nominalRate);
+        if (reportedValid)
+            self.correctionBlocked = false;
+        if (contiguousSourceFrames && nominalValid &&
+            supportedMeasured(fallbackRate, nominalRate) && !reportedValid &&
+            !self.correctionBlocked) {
+            // Continuous source frames prove that this is timestamp noise, not
+            // absent audio. Retain the mapped phase and use the measured slope.
+            const long double duration =
+                static_cast<long double>(frame - previous.frame) * 1e9L / fallbackRate;
+            if (duration < 1 || duration >= static_cast<long double>(UINT64_MAX))
+                return false;
+            const auto whole = static_cast<uint64_t>(duration);
+            if (previous.ns > UINT64_MAX - whole)
+                return false;
+            const auto candidate = previous.ns + whole;
+            const auto correction = candidate >= hostNs ? candidate - hostNs : hostNs - candidate;
+            // Match AudioHistory's two-millisecond discontinuity boundary, and
+            // require a valid raw interval or reset after a breached bound.
+            if (correction > maximumPhaseCorrectionNs)
+                self.correctionBlocked = true;
+            else
+                mappedNs = candidate;
+        }
+        if (mappedNs <= previous.ns)
             return false;
     }
     auto& record = self.records[ticket % self.capacity];
     record.stamp.store(0);
     record.frame.store(frame);
-    record.ns.store(hostNs);
+    record.ns.store(mappedNs);
+    record.reportedNs.store(hostNs);
     record.contiguous.store(contiguousSourceFrames);
     record.stamp.store(ticket + 1);
     self.end.store(ticket + 1);
     return true;
 }
+uint64_t SampleClockHistory::lastHostNs() const noexcept {
+    auto& self = *impl_;
+    const auto end = self.end.load();
+    if (end == self.begin.load())
+        return 0;
+    Anchor last;
+    return self.read(end - 1, last) ? last.ns : 0;
+}
 void SampleClockHistory::reset() noexcept {
+    impl_->correctionBlocked = false;
     impl_->begin.store(impl_->end.load());
 }
 SampleClockHistory::Snapshot SampleClockHistory::snapshot() const noexcept {

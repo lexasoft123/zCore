@@ -217,7 +217,7 @@ bool AudioHistory::append(RoutingInput input, uint32_t frames, uint64_t firstHos
         if (error > 2e9 / nominalRate)
             self.diagnostics->verifiedClockSteps.fetch_add(1, std::memory_order_relaxed);
     }
-    if (!self.clock.append(self.cursor, firstHostNs, contiguous)) {
+    if (!self.clock.append(self.cursor, firstHostNs, contiguous, nominalRate, measuredRate)) {
         self.online.store(false);
         self.version.fetch_add(1);
         return false;
@@ -228,7 +228,7 @@ bool AudioHistory::append(RoutingInput input, uint32_t frames, uint64_t firstHos
     self.previousSource = sourceFrame;
     self.previousSourceValid = sourceFrameValid;
     self.anchorFrame.store(self.cursor);
-    self.anchorNs.store(firstHostNs);
+    self.anchorNs.store(self.clock.lastHostNs());
     self.rateBits.store(std::bit_cast<uint64_t>(measuredRate));
     self.nominalBits.store(std::bit_cast<uint64_t>(nominalRate));
     self.anchorFrames.store(frames);

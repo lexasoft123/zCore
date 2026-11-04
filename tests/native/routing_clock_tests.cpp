@@ -114,6 +114,131 @@ void driftingCaptureAndOutput() {
     std::printf("Split capture/output clocks: %.6f ppm error, %.2f dB SNR, %u checked blocks\n",
         maximumRateErrorPpm, minimumSnr, verified);
 }
+uint64_t jitteredNs(uint64_t origin, long double elapsed, uint32_t block) {
+    constexpr long double step = 1707894;
+    const long double phase = block % 12 == 1 ? step : block % 12 == 6 ? -step : 0;
+    return origin + static_cast<uint64_t>(elapsed + phase);
+}
+void verifiedTimestampPhaseSteps() {
+    constexpr uint32_t nominal = 48000, captureFrames = 256, renderFrames = 64;
+    constexpr uint64_t origin = 9000000000ULL;
+    constexpr double captureRate = nominal * 1.00032;
+    constexpr double outputRate = nominal * .99992;
+    AudioHistory history(1, 32768, ResamplingFilter::LinearPhase, true);
+    std::array<float, captureFrames> input{};
+    const std::array<const float*, 1> source{input.data()};
+    uint64_t sourceFrame = 0;
+    long double captureElapsed = 0;
+    for (uint32_t block = 0; block < 120; ++block) {
+        for (uint32_t frame = 0; frame < captureFrames; ++frame)
+            input[frame] = .1F + static_cast<float>(sourceFrame + frame) * .000001F;
+        CHECK(noHeap([&] {
+            return history.append({source, captureFrames}, captureFrames,
+                jitteredNs(origin, captureElapsed * 1e9L, block), nominal,
+                static_cast<double>(sourceFrame), true);
+        }));
+        sourceFrame += captureFrames;
+        captureElapsed += static_cast<long double>(captureFrames) / captureRate;
+    }
+    CHECK(history.status().discontinuities == 0);
+    CHECK(std::abs(history.status().measuredRate / captureRate - 1) * 1e6 < 2);
+    std::array<float, renderFrames> output{};
+    const std::array<float*, 1> destination{output.data()};
+    AudioReadCursor reader;
+    long double outputElapsed = 2048.0L / outputRate;
+    uint32_t reads = 0;
+    while (outputElapsed < captureElapsed - 4096.0L / captureRate) {
+        const auto first = origin + static_cast<uint64_t>(outputElapsed * 1e9L);
+        const auto result = noHeap([&] {
+            return history.read(first, outputRate, {destination, renderFrames}, renderFrames, reader);
+        });
+        CHECK(result.online && result.missingFrames == 0);
+        for (uint32_t frame = 0; frame < renderFrames; ++frame) {
+            const long double host = static_cast<long double>(first - origin) +
+                                     static_cast<long double>(frame) * 1e9L / outputRate;
+            const float expected = .1F + static_cast<float>(host * captureRate / 1e9L) * .000001F;
+            CHECK(std::isfinite(output[frame]) && std::abs(output[frame] - expected) < .000004F);
+            if (frame) CHECK(output[frame] > output[frame - 1]);
+        }
+        outputElapsed += static_cast<long double>(renderFrames) / outputRate;
+        ++reads;
+    }
+    CHECK(reads > 300);
+    const auto diagnostics = history.readDiagnostics();
+    CHECK(diagnostics.enabled && diagnostics.verifiedClockSteps > 0);
+    CHECK(diagnostics.maximumVerifiedClockStepNs >= 1707893);
+    CHECK(diagnostics.missingFrames[static_cast<size_t>(AudioHistoryMissingReason::ClockMapping)] == 0);
+
+    AudioHistory impulses(1);
+    std::array<float, renderFrames> impulseOutput{};
+    const std::array<float*, 1> impulseDestination{impulseOutput.data()};
+    AudioReadCursor impulseReader;
+    for (uint32_t block = 0; block < 6; ++block) {
+        input.fill(0);
+        if (block == 0) input[100] = .5F;
+        CHECK(noHeap([&] {
+            return impulses.append({source, captureFrames}, captureFrames,
+                jitteredNs(origin, static_cast<long double>(block * captureFrames) * 1e9L / nominal,
+                           block),
+                nominal, static_cast<double>(block * captureFrames), true);
+        }));
+        if (block == 1) {
+            const auto latest = noHeap([&] {
+                return impulses.read(impulses.status().lastHostNs, nominal,
+                    {impulseDestination, renderFrames}, renderFrames, impulseReader);
+            });
+            CHECK(latest.online && latest.missingFrames == 0);
+        }
+    }
+    const auto impulse = noHeap([&] {
+        return impulses.read(origin + ns(64, nominal), nominal,
+            {impulseDestination, renderFrames}, renderFrames, impulseReader);
+    });
+    CHECK(impulse.online && impulse.missingFrames == 0);
+    CHECK(std::abs(impulseOutput[100 - 64] - .5F) < .00001F);
+
+    input.fill(.2F);
+    CHECK(noHeap([&] {
+        return history.append({source, captureFrames}, captureFrames,
+            origin + static_cast<uint64_t>(captureElapsed * 1e9L), nominal,
+            static_cast<double>(sourceFrame + 17), true);
+    }));
+    CHECK(history.status().discontinuities == 1);
+    const auto beforeGap = origin + ns(4096, nominal);
+    const auto rejected = noHeap([&] {
+        return history.read(beforeGap, outputRate, {destination, renderFrames}, renderFrames, reader);
+    });
+    CHECK(rejected.missingFrames == renderFrames);
+}
+void sustainedUnsupportedRateIsNotCorrected() {
+    constexpr uint32_t nominal = 48000, captureFrames = 256, renderFrames = 64;
+    constexpr uint64_t origin = 9000000000ULL, reportedInterval = 6333333;
+    AudioHistory history(1, 32768, ResamplingFilter::LinearPhase, true);
+    std::array<float, captureFrames> input{};
+    input.fill(.125F);
+    const std::array<const float*, 1> source{input.data()};
+    for (uint32_t block = 0; block < 100; ++block) {
+        CHECK(noHeap([&] {
+            return history.append({source, captureFrames}, captureFrames,
+                origin + block * reportedInterval, nominal,
+                static_cast<double>(block * captureFrames), true);
+        }));
+    }
+    CHECK(history.status().discontinuities == 0);
+    CHECK(history.status().measuredRate == nominal);
+    const auto reportedLatest = origin + 99 * reportedInterval;
+    CHECK(history.status().lastHostNs == reportedLatest);
+    std::array<float, renderFrames> output{};
+    const std::array<float*, 1> destination{output.data()};
+    AudioReadCursor reader;
+    const auto result = noHeap([&] {
+        return history.read(reportedLatest, nominal, {destination, renderFrames}, renderFrames, reader);
+    });
+    CHECK(result.online && result.missingFrames == renderFrames);
+    const auto diagnostics = history.readDiagnostics();
+    CHECK(diagnostics.missingFrames[static_cast<size_t>(AudioHistoryMissingReason::ClockMapping)] ==
+          renderFrames);
+}
 void silenceChannelsAndRestart() {
     AudioHistory history(2, 2048);
     std::array<float,256> input{};input.fill(.125f);
@@ -160,6 +285,8 @@ void silenceChannelsAndRestart() {
 }
 int main() {
     driftingCaptureAndOutput();
+    verifiedTimestampPhaseSteps();
+    sustainedUnsupportedRateIsNotCorrected();
     silenceChannelsAndRestart();
-    std::puts("Capture history drift, silence, absent channels, restart and nonfinite checks passed");
+    std::puts("Capture history drift, phase steps, unsupported rates, restart and nonfinite checks passed");
 }
