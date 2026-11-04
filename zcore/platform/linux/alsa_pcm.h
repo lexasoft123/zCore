@@ -50,6 +50,7 @@ struct AlsaPcm final {
 
 using AlsaCapturePush = bool (*)(void*, const float*, uint32_t, uint32_t,
                                  uint64_t, uint64_t) noexcept;
+enum class AlsaCaptureOperation { Read, Prepare, Start };
 class __attribute__((visibility("hidden"))) AlsaCaptureRoute;
 
 // A direction lease: subscribing does not start callbacks. Capture adapters
@@ -68,6 +69,11 @@ class __attribute__((visibility("hidden"))) AlsaCaptureLease final {
   uint32_t period() const noexcept;
   uint32_t bufferFrames() const noexcept;
   uint64_t nonFiniteSamples() const noexcept;
+#if defined(SINGZ_CORE_TESTS)
+  void setOperationsForTests(
+      snd_pcm_sframes_t (*)(void*, AlsaCaptureOperation, void*, snd_pcm_uframes_t),
+      void* context);
+#endif
  private:
   AlsaCaptureLease() = default;
   friend std::unique_ptr<AlsaCaptureLease> acquireAlsaCapture(

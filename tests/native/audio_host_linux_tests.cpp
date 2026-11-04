@@ -277,6 +277,152 @@ void leases() {
   CHECK(leases[1]->start(error));
   CHECK(until([&] { return counts[1] > held; }));
 }
+struct CaptureRecoveryObservation {
+  AudioInputRing ring{16, 256};
+  std::array<float, 256> mono{};
+  std::array<uint64_t, 8> sourceFrames{};
+  std::atomic<uint32_t> callbacks{0};
+  bool invalid{false};
+  static bool push(void* context, const float* input, uint32_t channels,
+                   uint32_t frames, uint64_t source, uint64_t firstSampleNs) noexcept {
+    auto& self = *static_cast<CaptureRecoveryObservation*>(context);
+    if (!frames || frames > self.mono.size() || !input || !channels) {
+      self.invalid = true;
+      return false;
+    }
+    for (uint32_t frame = 0; frame < frames; ++frame)
+      self.mono[frame] = input[size_t(frame) * channels];
+    const auto index = self.callbacks.load(std::memory_order_relaxed);
+    if (index < self.sourceFrames.size()) self.sourceFrames[index] = source;
+    self.callbacks.store(index + 1, std::memory_order_release);
+    // Only the initial metadata blocks enter the ring. Callback counting
+    // independently proves continuation without requiring queue admission.
+    if (index >= 4) return true;
+    const bool pushed = self.ring.push(self.mono.data(), frames, firstSampleNs,
+        detail::alsaMonotonicNs(), firstSampleNs ?
+            AudioInputTimestampQuality::CallbackEstimate :
+            AudioInputTimestampQuality::Unknown);
+    if (!pushed) self.invalid = true;
+    return pushed;
+  }
+};
+struct CaptureRecoveryScript {
+  using Operation = detail::AlsaCaptureOperation;
+  uint32_t reads{0}, prepares{0}, starts{0};
+  uint32_t injectAfter{0}, injections{1};
+  int readResult{-EPIPE}, recoveryResult{-EIO};
+  bool failRecovery{false};
+  Operation recoveryFailureOperation{Operation::Prepare};
+  static snd_pcm_sframes_t operation(void* context, Operation action,
+      void* data, snd_pcm_uframes_t frames) {
+    auto& self = *static_cast<CaptureRecoveryScript*>(context);
+    if (action == Operation::Prepare) ++self.prepares;
+    if (action == Operation::Start) ++self.starts;
+    if (action != Operation::Read) {
+      if (self.failRecovery && self.recoveryFailureOperation == action)
+        return self.recoveryResult;
+      return 0;
+    }
+    ++self.reads;
+    if (self.injections && self.reads > self.injectAfter) {
+      --self.injections;
+      return self.readResult;
+    }
+    if (!data) return -EIO;
+    const auto accepted = std::min<snd_pcm_uframes_t>(64, frames);
+    std::memset(data, 0, size_t(accepted) * 8);
+    return accepted;
+  }
+};
+void captureRecovery() {
+  CaptureRecoveryObservation firstObserved, secondObserved;
+  CaptureRecoveryScript script;
+  script.injectAfter = 2;
+  script.injections = 2;
+  std::string error;
+  auto first = detail::acquireAlsaCapture("test-capture-recovery", "null", 2,
+      48000, 256, CaptureRecoveryObservation::push, &firstObserved, error);
+  auto second = detail::acquireAlsaCapture("test-capture-recovery", "null", 2,
+      48000, 256, CaptureRecoveryObservation::push, &secondObserved, error);
+  CHECK(first && second);
+  first->setOperationsForTests(CaptureRecoveryScript::operation, &script);
+  CHECK(first->start(error) && second->start(error));
+  CHECK(until([&] { return firstObserved.callbacks >= 4 && secondObserved.callbacks >= 4; }));
+  CHECK(first->failure() == 0 && second->failure() == 0);
+  const auto continued = secondObserved.callbacks.load();
+  first->stop();
+  CHECK(until([&] { return secondObserved.callbacks > continued; }));
+  second->stop();
+  CHECK(script.reads >= 7 && script.prepares == 2 && script.starts == 2);
+  CHECK(firstObserved.sourceFrames[2] == 128 && firstObserved.sourceFrames[3] == 192);
+  CHECK(!firstObserved.invalid && !secondObserved.invalid);
+  CHECK(firstObserved.ring.overruns() == 0 && secondObserved.ring.overruns() == 0);
+  AudioInputBlockView block;
+  CHECK(firstObserved.ring.peek(block, 48000));
+  CHECK(block.capture.sequence == 0 && block.capture.sourceFrame == 0 &&
+      block.capture.discontinuity == AudioInputDiscontinuityReason::None &&
+      block.capture.sampleHostTimeNs != 0);
+  firstObserved.ring.consume();
+  CHECK(firstObserved.ring.peek(block, 48000));
+  CHECK(block.capture.sequence == 1 && block.capture.sourceFrame == 64 &&
+      block.capture.discontinuity == AudioInputDiscontinuityReason::None);
+  firstObserved.ring.consume();
+  CHECK(firstObserved.ring.peek(block, 48000));
+  CHECK(block.capture.sequence == 2 && block.capture.sourceFrame == 128 &&
+      block.capture.discontinuity == AudioInputDiscontinuityReason::TimestampQualityChanged &&
+      (block.capture.flags & AudioInputDiscontinuous) != 0 &&
+      block.capture.sampleHostTimeNs == 0 &&
+      block.capture.timestampQuality == AudioInputTimestampQuality::Unknown &&
+      (block.capture.flags & AudioInputSampleHostTimeValid) == 0 &&
+      (block.capture.flags & AudioInputTimestampQualityValid) == 0);
+  firstObserved.ring.consume();
+  CHECK(firstObserved.ring.peek(block, 48000));
+  CHECK(block.capture.sequence == 3 && block.capture.sourceFrame == 192 &&
+      block.capture.discontinuity == AudioInputDiscontinuityReason::TimestampQualityChanged &&
+      block.capture.sampleHostTimeNs != 0 &&
+      block.capture.timestampQuality == AudioInputTimestampQuality::CallbackEstimate &&
+      (block.capture.flags & AudioInputSampleHostTimeValid) != 0 &&
+      (block.capture.flags & AudioInputStaleAnchor) != 0);
+  firstObserved.ring.consume();
+}
+void captureRecoveryFailures() {
+  using Operation = CaptureRecoveryScript::Operation;
+  struct Case {
+    int readResult;
+    bool failRecovery;
+    Operation failureOperation;
+    int expected;
+    uint32_t prepares, starts;
+  };
+  const std::array<Case, 6> cases{{
+    {-ENODEV, false, Operation::Read, -ENODEV, 0, 0},
+    {-ESTRPIPE, false, Operation::Read, -ESTRPIPE, 0, 0},
+    {0, false, Operation::Read, -EIO, 0, 0},
+    {std::numeric_limits<int>::max(), false, Operation::Read, -EIO, 0, 0},
+    {-EPIPE, true, Operation::Prepare, -EIO, 1, 0},
+    {-EPIPE, true, Operation::Start, -EIO, 1, 1},
+  }};
+  for (size_t index = 0; index < cases.size(); ++index) {
+    const auto& test = cases[index];
+    CaptureRecoveryObservation observed;
+    CaptureRecoveryScript script;
+    script.readResult = test.readResult;
+    script.failRecovery = test.failRecovery;
+    script.recoveryFailureOperation = test.failureOperation;
+    std::string error;
+    auto lease = detail::acquireAlsaCapture(
+        "test-capture-terminal-" + std::to_string(index), "null", 2, 48000, 256,
+        CaptureRecoveryObservation::push, &observed, error);
+    CHECK(lease);
+    lease->setOperationsForTests(CaptureRecoveryScript::operation, &script);
+    CHECK(lease->start(error));
+    CHECK(until([&] { return lease->failure() == test.expected; }));
+    lease->stop();
+    CHECK(script.reads == 1 && script.prepares == test.prepares &&
+        script.starts == test.starts);
+    CHECK(observed.callbacks == 0 && observed.ring.overruns() == 0 && !observed.invalid);
+  }
+}
 
 // A real snd-aloop peer. Its deterministic signal stays inside the kernel
 // virtual cable; never open an HDA/USB/default playback device in this test.
@@ -421,6 +567,7 @@ int main(int argc, char** argv) {
   else {
     CHECK(argc == 1);
     conversion(); lifecycle(); shortTransfers(); recoveredUnderrun(); recoveryFailures(); leases();
-    std::puts("PASS ALSA conversion, lifecycle, failure/recovery and bounded capture lease tests");
+    captureRecovery(); captureRecoveryFailures();
+    std::puts("PASS ALSA conversion, lifecycle, output/capture recovery and bounded capture lease tests");
   }
 }

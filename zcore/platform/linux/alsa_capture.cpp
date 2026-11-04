@@ -69,19 +69,58 @@ class __attribute__((visibility("hidden"))) AlsaCaptureRoute final {
       client.push = nullptr; client.context = nullptr; client.leased = false;
     }
   }
+  snd_pcm_sframes_t operation(AlsaCaptureOperation action, void* data,
+                              snd_pcm_uframes_t frames) noexcept {
+#if defined(SINGZ_CORE_TESTS)
+    if (testOperation) return testOperation(testContext, action, data, frames);
+#endif
+    switch (action) {
+      case AlsaCaptureOperation::Read:
+        return snd_pcm_readi(pcm.handle, data, frames);
+      case AlsaCaptureOperation::Prepare:
+        return snd_pcm_prepare(pcm.handle);
+      case AlsaCaptureOperation::Start:
+        return snd_pcm_start(pcm.handle);
+    }
+    return -EIO;
+  }
+  bool recoverOverrun() noexcept {
+    auto result = operation(AlsaCaptureOperation::Prepare, nullptr, 0);
+    if (result >= 0) result = operation(AlsaCaptureOperation::Start, nullptr, 0);
+    if (result < 0) {
+      failure.store(int(result), std::memory_order_release);
+      return false;
+    }
+    // Repeated overruns stay in one unanchored segment. Only recovered data is
+    // delivered; sourceFrame remains a count of frames actually received.
+    invalidateTimestamp = true;
+    return true;
+  }
+  bool handleFailure(int error) noexcept {
+    if (error == -EPIPE) return recoverOverrun();
+    failure.store(error, std::memory_order_release);
+    return false;
+  }
   void run() noexcept {
     while (!stopping.load(std::memory_order_acquire)) {
       const int ready = pcm.wait();
       if (stopping.load(std::memory_order_acquire)) break;
-      if (ready < 0) { failure.store(ready, std::memory_order_release); break; }
+      if (ready < 0) {
+        if (handleFailure(ready)) continue;
+        break;
+      }
       if (!ready) continue;
       const auto available = snd_pcm_avail_update(pcm.handle);
       if (available == -EINTR || available == -EAGAIN || available == 0) continue;
-      if (available < 0) { failure.store(int(available), std::memory_order_release); break; }
-      const snd_pcm_sframes_t count = snd_pcm_readi(pcm.handle, bytes.data(), pcm.period);
+      if (available < 0) {
+        if (handleFailure(int(available))) continue;
+        break;
+      }
+      const snd_pcm_sframes_t count =
+          operation(AlsaCaptureOperation::Read, bytes.data(), pcm.period);
       if (count == -EAGAIN || count == -EINTR) continue;
       if (count <= 0 || count > pcm.period) {
-        failure.store(count < 0 ? int(count) : -EIO, std::memory_order_release);
+        if (handleFailure(count < 0 ? int(count) : -EIO)) continue;
         break;
       }
       const auto frames = uint32_t(count);
@@ -89,7 +128,10 @@ class __attribute__((visibility("hidden"))) AlsaCaptureRoute final {
           frames * pcm.channels, pcm.sampleFormat), std::memory_order_relaxed);
       const uint64_t now = alsaMonotonicNs();
       const uint64_t queuedNs = uint64_t(double(available) * 1e9 / pcm.rate);
-      const uint64_t estimatedFirstSample = now > queuedNs ? now - queuedNs : 0;
+      const bool timestampValid = !invalidateTimestamp;
+      invalidateTimestamp = false;
+      const uint64_t estimatedFirstSample =
+          timestampValid && now > queuedNs ? now - queuedNs : 0;
       // Queue-depth corrected monotonic estimate, never a hardware timestamp.
       for (auto& client : clients) {
         AudioInputCallbackScope scope(client.gate);
@@ -110,6 +152,12 @@ class __attribute__((visibility("hidden"))) AlsaCaptureRoute final {
   std::atomic<int> failure{0};
   std::atomic<uint64_t> nonFinite{0};
   uint64_t sourceFrame{0};
+  bool invalidateTimestamp{false};
+#if defined(SINGZ_CORE_TESTS)
+  snd_pcm_sframes_t (*testOperation)(void*, AlsaCaptureOperation, void*,
+                                     snd_pcm_uframes_t){nullptr};
+  void* testContext{nullptr};
+#endif
 };
 
 namespace {
@@ -170,4 +218,13 @@ uint32_t AlsaCaptureLease::bufferFrames() const noexcept { return route_->pcm.bu
 uint64_t AlsaCaptureLease::nonFiniteSamples() const noexcept {
   return route_->nonFinite.load(std::memory_order_relaxed);
 }
+#if defined(SINGZ_CORE_TESTS)
+void AlsaCaptureLease::setOperationsForTests(
+    snd_pcm_sframes_t (*operation)(void*, AlsaCaptureOperation, void*,
+                                   snd_pcm_uframes_t),
+    void* context) {
+  route_->testOperation = operation;
+  route_->testContext = context;
+}
+#endif
 }  // namespace singz::detail

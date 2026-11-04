@@ -65,7 +65,8 @@ class AlsaInput final : public AudioInputBackend {
       self.mono_[frame] = input[size_t(frame) * channels + self.channel_];
     return self.push_(self.context_, self.mono_.data(), frames,
         firstSampleNs, detail::alsaMonotonicNs(),
-        AudioInputTimestampQuality::CallbackEstimate);
+        firstSampleNs ? AudioInputTimestampQuality::CallbackEstimate :
+            AudioInputTimestampQuality::Unknown);
   }
   std::unique_ptr<detail::AlsaCaptureLease> lease_;
   std::vector<float> mono_;

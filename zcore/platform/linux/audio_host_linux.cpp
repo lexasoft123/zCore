@@ -207,8 +207,12 @@ class AlsaHost final : public AudioHostBackend {
   static bool capture(void* context, const float* input, uint32_t channels,
                        uint32_t frames, uint64_t source, uint64_t firstSampleNs) noexcept {
     auto& self = *static_cast<AlsaHost*>(context);
+    const bool timestampValid = firstSampleNs != 0;
+    const uint32_t discontinuity = timestampValid ? AudioHostDiscontinuityNone :
+        AudioHostDiscontinuityXRun | AudioHostDiscontinuityTimestampQualityChanged |
+            AudioHostDiscontinuityClockReanchored;
     detail::AudioHostCaptureSpan span{source, firstSampleNs,
-        frames, AudioHostDiscontinuityNone, true, false};
+        frames, discontinuity, timestampValid, false};
     return self.fifo_.writeInterleavedFloat(input, channels,
         self.config_.inputChannels.data(), frames, span, false);
   }
