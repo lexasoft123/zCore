@@ -75,6 +75,10 @@ class __attribute__((visibility("hidden"))) AlsaCaptureRoute final {
     if (testOperation) return testOperation(testContext, action, data, frames);
 #endif
     switch (action) {
+      case AlsaCaptureOperation::Timestamp: {
+        auto* snapshot = static_cast<AlsaCaptureSnapshot*>(data);
+        return snd_pcm_htimestamp(pcm.handle, &snapshot->available, &snapshot->time);
+      }
       case AlsaCaptureOperation::Read:
         return snd_pcm_readi(pcm.handle, data, frames);
       case AlsaCaptureOperation::Prepare:
@@ -93,6 +97,8 @@ class __attribute__((visibility("hidden"))) AlsaCaptureRoute final {
     }
     // Repeated overruns stay in one unanchored segment. Only recovered data is
     // delivered; sourceFrame remains a count of frames actually received.
+    previousTimestampNs = 0;
+    previousFirstSampleNs = 0;
     invalidateTimestamp = true;
     return true;
   }
@@ -110,12 +116,17 @@ class __attribute__((visibility("hidden"))) AlsaCaptureRoute final {
         break;
       }
       if (!ready) continue;
-      const auto available = snd_pcm_avail_update(pcm.handle);
-      if (available == -EINTR || available == -EAGAIN || available == 0) continue;
-      if (available < 0) {
-        if (handleFailure(int(available))) continue;
+      AlsaCaptureSnapshot snapshot;
+      const auto sampled = operation(AlsaCaptureOperation::Timestamp, &snapshot, 0);
+      if (sampled == -EINTR || sampled == -EAGAIN) continue;
+      if (sampled < 0) {
+        if (handleFailure(int(sampled))) continue;
         break;
       }
+      if (!snapshot.available) continue;
+      const uint64_t snapshotNs = alsaTimespecMonotonicNs(snapshot.time);
+      const uint64_t candidate = alsaCaptureFirstSampleNs(snapshot, pcm.rate, pcm.buffer,
+          previousTimestampNs, previousFirstSampleNs);
       const snd_pcm_sframes_t count =
           operation(AlsaCaptureOperation::Read, bytes.data(), pcm.period);
       if (count == -EAGAIN || count == -EINTR) continue;
@@ -123,16 +134,16 @@ class __attribute__((visibility("hidden"))) AlsaCaptureRoute final {
         if (handleFailure(count < 0 ? int(count) : -EIO)) continue;
         break;
       }
+      const uint64_t estimatedFirstSample = invalidateTimestamp ? 0 : candidate;
+      invalidateTimestamp = false;
+      if (candidate) {
+        previousTimestampNs = snapshotNs;
+        previousFirstSampleNs = candidate;
+      }
       const auto frames = uint32_t(count);
       nonFinite.fetch_add(alsaDecode(bytes.data(), samples.data(),
           frames * pcm.channels, pcm.sampleFormat), std::memory_order_relaxed);
-      const uint64_t now = alsaMonotonicNs();
-      const uint64_t queuedNs = uint64_t(double(available) * 1e9 / pcm.rate);
-      const bool timestampValid = !invalidateTimestamp;
-      invalidateTimestamp = false;
-      const uint64_t estimatedFirstSample =
-          timestampValid && now > queuedNs ? now - queuedNs : 0;
-      // Queue-depth corrected monotonic estimate, never a hardware timestamp.
+      // Co-sampled availability timestamp estimate, never hardware accuracy.
       for (auto& client : clients) {
         AudioInputCallbackScope scope(client.gate);
         if (scope && !client.push(client.context, samples.data(), pcm.channels,
@@ -152,6 +163,7 @@ class __attribute__((visibility("hidden"))) AlsaCaptureRoute final {
   std::atomic<int> failure{0};
   std::atomic<uint64_t> nonFinite{0};
   uint64_t sourceFrame{0};
+  uint64_t previousTimestampNs{0}, previousFirstSampleNs{0};
   bool invalidateTimestamp{false};
 #if defined(SINGZ_CORE_TESTS)
   snd_pcm_sframes_t (*testOperation)(void*, AlsaCaptureOperation, void*,

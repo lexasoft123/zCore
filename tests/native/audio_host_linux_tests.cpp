@@ -308,14 +308,35 @@ struct CaptureRecoveryObservation {
 };
 struct CaptureRecoveryScript {
   using Operation = detail::AlsaCaptureOperation;
-  uint32_t reads{0}, prepares{0}, starts{0};
+  uint32_t reads{0}, prepares{0}, starts{0}, timestamps{0};
   uint32_t injectAfter{0}, injections{1};
-  int readResult{-EPIPE}, recoveryResult{-EIO};
+  uint32_t timestampInjections{0}, delayReadMs{0};
+  uint32_t readEagain{0}, readEintr{0};
+  int readResult{-EPIPE}, recoveryResult{-EIO}, timestampResult{0};
+  snd_pcm_uframes_t timestampAvailable{64};
+  uint64_t fixedTimestampNs{0}, timestampStepNs{0};
   bool failRecovery{false};
   Operation recoveryFailureOperation{Operation::Prepare};
   static snd_pcm_sframes_t operation(void* context, Operation action,
       void* data, snd_pcm_uframes_t frames) {
     auto& self = *static_cast<CaptureRecoveryScript*>(context);
+    if (action == Operation::Timestamp) {
+      ++self.timestamps;
+      if (self.timestampInjections) {
+        --self.timestampInjections;
+        return self.timestampResult;
+      }
+      auto& snapshot = *static_cast<detail::AlsaCaptureSnapshot*>(data);
+      const uint64_t timestampNs = self.fixedTimestampNs ?
+          self.fixedTimestampNs + (self.timestamps - 1) * self.timestampStepNs :
+          detail::alsaMonotonicNs();
+      snapshot.available = self.timestampAvailable;
+      snapshot.time.tv_sec = static_cast<decltype(snapshot.time.tv_sec)>(
+          timestampNs / 1000000000ull);
+      snapshot.time.tv_nsec = static_cast<decltype(snapshot.time.tv_nsec)>(
+          timestampNs % 1000000000ull);
+      return 0;
+    }
     if (action == Operation::Prepare) ++self.prepares;
     if (action == Operation::Start) ++self.starts;
     if (action != Operation::Read) {
@@ -328,6 +349,10 @@ struct CaptureRecoveryScript {
       --self.injections;
       return self.readResult;
     }
+    if (self.readEagain) { --self.readEagain; return -EAGAIN; }
+    if (self.readEintr) { --self.readEintr; return -EINTR; }
+    if (self.delayReadMs)
+      std::this_thread::sleep_for(std::chrono::milliseconds(self.delayReadMs));
     if (!data) return -EIO;
     const auto accepted = std::min<snd_pcm_uframes_t>(64, frames);
     std::memset(data, 0, size_t(accepted) * 8);
@@ -422,6 +447,147 @@ void captureRecoveryFailures() {
         script.starts == test.starts);
     CHECK(observed.callbacks == 0 && observed.ring.overruns() == 0 && !observed.invalid);
   }
+}
+void captureTimestampConfiguration() {
+  std::string error;
+  detail::AlsaPcm capture;
+  CHECK(capture.open("null", true, 2, 48000, 256, 1024, error));
+  snd_pcm_sw_params_t* software = nullptr;
+  snd_pcm_sw_params_alloca(&software);
+  snd_pcm_tstamp_t mode = SND_PCM_TSTAMP_NONE;
+  snd_pcm_tstamp_type_t type = SND_PCM_TSTAMP_TYPE_GETTIMEOFDAY;
+  CHECK(snd_pcm_sw_params_current(capture.handle, software) == 0);
+  CHECK(snd_pcm_sw_params_get_tstamp_mode(software, &mode) == 0);
+  CHECK(snd_pcm_sw_params_get_tstamp_type(software, &type) == 0);
+  CHECK(mode == SND_PCM_TSTAMP_ENABLE && type == SND_PCM_TSTAMP_TYPE_MONOTONIC);
+  detail::AlsaPcm output;
+  CHECK(output.open("null", false, 2, 48000, 256, 1024, error));
+}
+void captureTimestampMath() {
+  detail::AlsaCaptureSnapshot snapshot;
+  snapshot.available = 3072;
+  snapshot.time.tv_sec = 100;
+  snapshot.time.tv_nsec = 0;
+  constexpr uint64_t expected = 99936000000ull;
+  CHECK(detail::alsaTimespecMonotonicNs(snapshot.time) == 100000000000ull);
+  CHECK(detail::alsaCaptureFirstSampleNs(snapshot, 48000, 16384, 0, 0) == expected);
+  CHECK(detail::alsaCaptureFirstSampleNs(snapshot, 48000, 16384,
+      100000000001ull, 0) == 0);
+  CHECK(detail::alsaCaptureFirstSampleNs(snapshot, 48000, 16384,
+      0, expected + 1) == 0);
+  CHECK(detail::alsaCaptureFirstSampleNs(snapshot, 48000, 16384,
+      0, expected) == 0);
+  auto advanced = snapshot;
+  advanced.available = 1536;
+  CHECK(detail::alsaCaptureFirstSampleNs(advanced, 48000, 16384,
+      100000000000ull, expected) == 99968000000ull);
+  auto invalid = snapshot;
+  invalid.time.tv_sec = 0;
+  invalid.time.tv_nsec = 0;
+  CHECK(detail::alsaCaptureFirstSampleNs(invalid, 48000, 16384, 0, 0) == 0);
+  invalid = snapshot;
+  invalid.time.tv_sec = -1;
+  CHECK(detail::alsaCaptureFirstSampleNs(invalid, 48000, 16384, 0, 0) == 0);
+  invalid = snapshot;
+  invalid.time.tv_nsec = 1000000000L;
+  CHECK(detail::alsaCaptureFirstSampleNs(invalid, 48000, 16384, 0, 0) == 0);
+  invalid = snapshot;
+  invalid.available = 0;
+  CHECK(detail::alsaCaptureFirstSampleNs(invalid, 48000, 16384, 0, 0) == 0);
+  invalid = snapshot;
+  invalid.available = 16385;
+  CHECK(detail::alsaCaptureFirstSampleNs(invalid, 48000, 16384, 0, 0) == 0);
+  invalid = snapshot;
+  invalid.time.tv_sec = 0;
+  invalid.time.tv_nsec = 1000;
+  CHECK(detail::alsaCaptureFirstSampleNs(invalid, 48000, 16384, 0, 0) == 0);
+  CHECK(detail::alsaCaptureFirstSampleNs(snapshot, 0, 16384, 0, 0) == 0);
+  CHECK(detail::alsaCaptureFirstSampleNs(snapshot, 48000, 0, 0, 0) == 0);
+  invalid = snapshot;
+  invalid.time.tv_sec = std::numeric_limits<decltype(invalid.time.tv_sec)>::max();
+  invalid.time.tv_nsec = 999999999L;
+  const auto seconds = static_cast<uint64_t>(invalid.time.tv_sec);
+  if (seconds > (std::numeric_limits<uint64_t>::max() - 999999999ull) / 1000000000ull)
+    CHECK(detail::alsaTimespecMonotonicNs(invalid.time) == 0);
+}
+void captureTimestampDelay() {
+  CaptureRecoveryObservation observed;
+  CaptureRecoveryScript script;
+  script.injections = 0;
+  script.fixedTimestampNs = 100000000000ull;
+  script.timestampAvailable = 512;
+  script.delayReadMs = 3;
+  std::string error;
+  auto lease = detail::acquireAlsaCapture("test-capture-fixed-htimestamp", "null",
+      2, 48000, 256, CaptureRecoveryObservation::push, &observed, error);
+  CHECK(lease);
+  lease->setOperationsForTests(CaptureRecoveryScript::operation, &script);
+  CHECK(lease->start(error));
+  CHECK(until([&] { return observed.callbacks >= 1; }));
+  CHECK(lease->failure() == 0);
+  lease->stop();
+  CHECK(!observed.invalid && observed.ring.overruns() == 0);
+  AudioInputBlockView block;
+  CHECK(observed.ring.peek(block, 48000));
+  CHECK(block.capture.sourceFrame == 0 && block.capture.sampleHostTimeNs == 99989333334ull &&
+      block.capture.timestampQuality == AudioInputTimestampQuality::CallbackEstimate &&
+      (block.capture.flags & AudioInputSampleHostTimeValid) != 0);
+  observed.ring.consume();
+}
+void captureTimestampRecovery() {
+  CaptureRecoveryObservation observed;
+  CaptureRecoveryScript script;
+  script.injections = 0;
+  script.timestampInjections = 1;
+  script.timestampResult = -EPIPE;
+  script.fixedTimestampNs = 100000000000ull;
+  script.timestampStepNs = 1000000ull;
+  script.readEagain = 1;
+  script.readEintr = 1;
+  std::string error;
+  auto lease = detail::acquireAlsaCapture("test-capture-htimestamp-recovery", "null",
+      2, 48000, 256, CaptureRecoveryObservation::push, &observed, error);
+  CHECK(lease);
+  lease->setOperationsForTests(CaptureRecoveryScript::operation, &script);
+  CHECK(lease->start(error));
+  CHECK(until([&] { return observed.callbacks >= 2; }));
+  CHECK(lease->failure() == 0);
+  lease->stop();
+  CHECK(script.timestamps >= 5 && script.reads >= 4 &&
+      script.readEagain == 0 && script.readEintr == 0 &&
+      script.prepares == 1 && script.starts == 1);
+  CHECK(!observed.invalid && observed.ring.overruns() == 0);
+  AudioInputBlockView block;
+  CHECK(observed.ring.peek(block, 48000));
+  CHECK(block.capture.sourceFrame == 0 && block.capture.sampleHostTimeNs == 0 &&
+      block.capture.timestampQuality == AudioInputTimestampQuality::Unknown &&
+      (block.capture.flags & AudioInputSampleHostTimeValid) == 0);
+  observed.ring.consume();
+  CHECK(observed.ring.peek(block, 48000));
+  CHECK(block.capture.sequence == 1 && block.capture.sourceFrame == 64 &&
+      block.capture.sampleHostTimeNs != 0 &&
+      block.capture.discontinuity == AudioInputDiscontinuityReason::TimestampQualityChanged &&
+      block.capture.timestampQuality == AudioInputTimestampQuality::CallbackEstimate &&
+      (block.capture.flags & AudioInputSampleHostTimeValid) != 0);
+  observed.ring.consume();
+}
+void captureTimestampApiFailure() {
+  CaptureRecoveryObservation observed;
+  CaptureRecoveryScript script;
+  script.injections = 0;
+  script.timestampInjections = 1;
+  script.timestampResult = -ENOSYS;
+  std::string error;
+  auto lease = detail::acquireAlsaCapture("test-capture-htimestamp-failure", "null",
+      2, 48000, 256, CaptureRecoveryObservation::push, &observed, error);
+  CHECK(lease);
+  lease->setOperationsForTests(CaptureRecoveryScript::operation, &script);
+  CHECK(lease->start(error));
+  CHECK(until([&] { return lease->failure() == -ENOSYS; }));
+  lease->stop();
+  CHECK(script.timestamps == 1 && script.reads == 0 &&
+      script.prepares == 0 && script.starts == 0);
+  CHECK(observed.callbacks == 0 && observed.ring.overruns() == 0 && !observed.invalid);
 }
 
 // A real snd-aloop peer. Its deterministic signal stays inside the kernel
@@ -567,7 +733,9 @@ int main(int argc, char** argv) {
   else {
     CHECK(argc == 1);
     conversion(); lifecycle(); shortTransfers(); recoveredUnderrun(); recoveryFailures(); leases();
-    captureRecovery(); captureRecoveryFailures();
-    std::puts("PASS ALSA conversion, lifecycle, output/capture recovery and bounded capture lease tests");
+    captureRecovery(); captureRecoveryFailures(); captureTimestampConfiguration();
+    captureTimestampMath(); captureTimestampDelay(); captureTimestampRecovery();
+    captureTimestampApiFailure();
+    std::puts("PASS ALSA conversion, lifecycle, output/capture recovery, timestamps and bounded capture lease tests");
   }
 }

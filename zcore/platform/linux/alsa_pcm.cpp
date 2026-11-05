@@ -12,6 +12,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <limits>
 
 namespace singz::detail {
 static_assert(std::endian::native == std::endian::little,
@@ -25,6 +26,30 @@ uint64_t alsaClockId(const std::string& uid) noexcept {
   uint64_t hash = 14695981039346656037ull;
   for (unsigned char c : uid) hash = (hash ^ c) * 1099511628211ull;
   return hash ? hash : 1;
+}
+uint64_t alsaTimespecMonotonicNs(const snd_htimestamp_t& time) noexcept {
+  constexpr uint64_t billion = 1000000000ull;
+  if (time.tv_sec < 0 || time.tv_nsec < 0 || time.tv_nsec >= 1000000000L) return 0;
+  const auto seconds = static_cast<uint64_t>(time.tv_sec);
+  const auto nanoseconds = static_cast<uint64_t>(time.tv_nsec);
+  const auto maximum = std::numeric_limits<uint64_t>::max();
+  if (seconds > (maximum - nanoseconds) / billion) return 0;
+  return seconds * billion + nanoseconds;
+}
+uint64_t alsaCaptureFirstSampleNs(const AlsaCaptureSnapshot& snapshot,
+    uint32_t rate, uint32_t bufferFrames, uint64_t previousTimestampNs,
+    uint64_t previousFirstSampleNs) noexcept {
+  const uint64_t timestampNs = alsaTimespecMonotonicNs(snapshot.time);
+  if (!timestampNs || timestampNs < previousTimestampNs || !rate || !bufferFrames ||
+      !snapshot.available || snapshot.available > bufferFrames) return 0;
+  const long double queued = static_cast<long double>(snapshot.available) * 1e9L / rate;
+  if (!std::isfinite(queued) || queued < 0 || queued > timestampNs) return 0;
+  const auto queuedNs = static_cast<uint64_t>(queued);
+  if (queuedNs > timestampNs) return 0;
+  const uint64_t firstSampleNs = timestampNs - queuedNs;
+  if (!firstSampleNs ||
+      (previousFirstSampleNs && firstSampleNs <= previousFirstSampleNs)) return 0;
+  return firstSampleNs;
 }
 namespace {
 bool pcmError(int result, std::string& error) {
@@ -264,7 +289,23 @@ bool AlsaPcm::open(const std::string& name, bool capture, uint32_t needed,
       fail(snd_pcm_sw_params_get_boundary(software, &boundary)) ||
       fail(snd_pcm_sw_params_set_start_threshold(handle, software, boundary)) ||
       fail(snd_pcm_sw_params_set_avail_min(handle, software, period)) ||
+      (capture && fail(snd_pcm_sw_params_set_tstamp_mode(
+          handle, software, SND_PCM_TSTAMP_ENABLE))) ||
+      (capture && fail(snd_pcm_sw_params_set_tstamp_type(
+          handle, software, SND_PCM_TSTAMP_TYPE_MONOTONIC))) ||
       fail(snd_pcm_sw_params(handle, software))) return false;
+  if (capture) {
+    snd_pcm_tstamp_t mode = SND_PCM_TSTAMP_NONE;
+    snd_pcm_tstamp_type_t type = SND_PCM_TSTAMP_TYPE_GETTIMEOFDAY;
+    if (fail(snd_pcm_sw_params_current(handle, software)) ||
+        fail(snd_pcm_sw_params_get_tstamp_mode(software, &mode)) ||
+        fail(snd_pcm_sw_params_get_tstamp_type(software, &type))) return false;
+    if (mode != SND_PCM_TSTAMP_ENABLE || type != SND_PCM_TSTAMP_TYPE_MONOTONIC) {
+      error = "ALSA capture did not retain monotonic timestamp configuration";
+      close();
+      return false;
+    }
+  }
   const int count = snd_pcm_poll_descriptors_count(handle);
   if (count <= 0 || count > 64) {
     error = "ALSA returned an invalid polling descriptor count";

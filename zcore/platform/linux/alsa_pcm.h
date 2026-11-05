@@ -21,6 +21,14 @@ std::vector<AlsaEndpoint> alsaEndpoints();
 void alsaUniqueDefaults(std::vector<AlsaEndpoint>& endpoints) noexcept;
 uint64_t alsaMonotonicNs() noexcept;
 uint64_t alsaClockId(const std::string& uid) noexcept;
+struct AlsaCaptureSnapshot {
+  snd_pcm_uframes_t available{0};
+  snd_htimestamp_t time{};
+};
+uint64_t alsaTimespecMonotonicNs(const snd_htimestamp_t& time) noexcept;
+uint64_t alsaCaptureFirstSampleNs(const AlsaCaptureSnapshot& snapshot,
+    uint32_t rate, uint32_t bufferFrames, uint64_t previousTimestampNs,
+    uint64_t previousFirstSampleNs) noexcept;
 uint32_t alsaDecode(const unsigned char* source, float* target, uint32_t samples,
                 snd_pcm_format_t format) noexcept;
 uint32_t alsaEncode(const float* source, unsigned char* target, uint32_t samples,
@@ -50,7 +58,7 @@ struct AlsaPcm final {
 
 using AlsaCapturePush = bool (*)(void*, const float*, uint32_t, uint32_t,
                                  uint64_t, uint64_t) noexcept;
-enum class AlsaCaptureOperation { Read, Prepare, Start };
+enum class AlsaCaptureOperation { Timestamp, Read, Prepare, Start };
 class __attribute__((visibility("hidden"))) AlsaCaptureRoute;
 
 // A direction lease: subscribing does not start callbacks. Capture adapters

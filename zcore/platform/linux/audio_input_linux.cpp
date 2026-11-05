@@ -29,7 +29,7 @@ class AlsaInput final : public AudioInputBackend {
       prepared_.deviceChannels = lease_->channels();
       prepared_.sampleFormat = "converted planar float32";
       prepared_.sharingMode = "exclusive ALSA; shared capture lease";
-      prepared_.timestampSource = "monotonic read completion (estimated)";
+      prepared_.timestampSource = "ALSA monotonic htimestamp availability (estimated)";
       return prepared_;
     }
     return fail("ALSA capture endpoint was not found", config.channel);
