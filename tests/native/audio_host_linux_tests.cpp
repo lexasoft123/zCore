@@ -18,6 +18,10 @@
   std::abort(); } } while (false)
 using namespace singz;
 using namespace std::chrono_literals;
+namespace singz {
+std::unique_ptr<AudioInputBackend> makeAlsaAudioInputBackendForTests(
+    const std::string& pcm, uint32_t channels);
+}
 namespace {
 static_assert(!std::is_copy_constructible_v<detail::AlsaCaptureLease>);
 template <class Predicate> bool until(Predicate predicate, uint32_t milliseconds = 2000) {
@@ -418,6 +422,152 @@ void leases() {
   std::this_thread::sleep_for(10ms); CHECK(counts[1] == held);
   CHECK(leases[1]->start(error));
   CHECK(until([&] { return counts[1] > held; }));
+}
+struct BusObservation {
+  std::atomic<uint32_t> callbacks{0};
+  std::array<AudioInputTimestampQuality, 8> qualities{};
+  std::array<uint64_t, 8> first{}, delivery{};
+  std::atomic<bool> invalid{false};
+  static bool push(void* context, const AudioInputBusBlock& block) noexcept {
+    auto& self = *static_cast<BusObservation*>(context);
+    const auto index = self.callbacks.load(std::memory_order_relaxed);
+    if (!block.planes || block.channelCount != 2 || !block.frames ||
+        block.frames > block.capacityFrames || block.capacityFrames > 256 ||
+        !block.planes[0] || !block.planes[1])
+      self.invalid.store(true, std::memory_order_relaxed);
+    else
+      for (uint32_t frame = 0; frame < block.frames; ++frame)
+        if (std::abs(block.planes[0][frame] - .8F) > .00001F ||
+            std::abs(block.planes[1][frame] + .9F) > .00001F)
+          self.invalid.store(true, std::memory_order_relaxed);
+    if (index < self.qualities.size()) {
+      self.qualities[index] = block.quality;
+      self.first[index] = block.firstNs;
+      self.delivery[index] = block.deliveryNs;
+    }
+    self.callbacks.store(index + 1, std::memory_order_release);
+    return true;
+  }
+};
+struct BusScript {
+  uint32_t timestamps{0}, unknown{1};
+  static snd_pcm_sframes_t operation(void* context, detail::AlsaCaptureOperation action,
+      void* data, snd_pcm_uframes_t frames) {
+    auto& self = *static_cast<BusScript*>(context);
+    if (action == detail::AlsaCaptureOperation::Timestamp) {
+      ++self.timestamps;
+      if (self.unknown) { --self.unknown; return -EPIPE; }
+      auto& snapshot = *static_cast<detail::AlsaCaptureSnapshot*>(data);
+      const uint64_t timestamp = 100000000000ull + (self.timestamps - 1) * 1000000ull;
+      snapshot.available = 64;
+      snapshot.time.tv_sec = static_cast<decltype(snapshot.time.tv_sec)>(timestamp / 1000000000ull);
+      snapshot.time.tv_nsec = static_cast<decltype(snapshot.time.tv_nsec)>(timestamp % 1000000000ull);
+      return 0;
+    }
+    if (action != detail::AlsaCaptureOperation::Read) return 0;
+    auto* samples = static_cast<float*>(data);
+    const auto accepted = std::min<snd_pcm_uframes_t>(64, frames);
+    for (snd_pcm_uframes_t frame = 0; frame < accepted; ++frame) {
+      for (uint32_t channel = 0; channel < 10; ++channel) samples[frame * 10 + channel] = 0;
+      samples[frame * 10 + 8] = .8F;
+      samples[frame * 10 + 9] = -.9F;
+    }
+    return accepted;
+  }
+};
+struct MonoBusObservation {
+  std::atomic<uint32_t> callbacks{0};
+  std::atomic<bool> invalid{false};
+  static bool push(void* context, const float* mono, uint32_t frames, uint64_t, uint64_t,
+                   AudioInputTimestampQuality) noexcept {
+    auto& self = *static_cast<MonoBusObservation*>(context);
+    if (!mono || !frames || std::abs(mono[0] - .8F) > .00001F)
+      self.invalid.store(true, std::memory_order_relaxed);
+    ++self.callbacks;
+    return true;
+  }
+};
+struct UnsupportedInput final : AudioInputBackend {
+  AudioInputResult open(const AudioInputConfig&, AudioInputPush, void*) override { return {}; }
+  AudioInputResult start() override { return {}; }
+  void stop() override {}
+  bool takeFailure(std::string&) override { return false; }
+};
+void audioInputBus() {
+  BusObservation observed;
+  AudioInputBusConfig invalid{"test-bus-invalid", {8, 8}};
+  auto backend = makeAlsaAudioInputBackendForTests("null", 10);
+  CHECK(backend->openBus(invalid, BusObservation::push, &observed).status ==
+        AudioInputBusOpenStatus::Error);
+  invalid.channels = {};
+  CHECK(backend->openBus(invalid, BusObservation::push, &observed).status ==
+        AudioInputBusOpenStatus::Error);
+  invalid.channels = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+  CHECK(backend->openBus(invalid, BusObservation::push, &observed).status ==
+        AudioInputBusOpenStatus::Error);
+  invalid.channels = {10};
+  CHECK(backend->openBus(invalid, BusObservation::push, &observed).status ==
+        AudioInputBusOpenStatus::Error);
+  invalid.channels = {std::numeric_limits<uint32_t>::max()};
+  CHECK(backend->openBus(invalid, BusObservation::push, &observed).status ==
+        AudioInputBusOpenStatus::Error);
+  invalid.channels = {8, 9};
+  CHECK(backend->openBus(invalid, nullptr, &observed).status == AudioInputBusOpenStatus::Error);
+  UnsupportedInput unsupported;
+  CHECK(unsupported.openBus(invalid, BusObservation::push, &observed).status ==
+        AudioInputBusOpenStatus::Unsupported);
+
+  const AudioInputBusConfig selection{"test-selected-bus", {8, 9}};
+  backend = makeAlsaAudioInputBackendForTests("null", 10);
+  auto opened = backend->openBus(selection, BusObservation::push, &observed);
+  CHECK(opened.status == AudioInputBusOpenStatus::Ready && opened.result.ok &&
+        opened.result.sampleRate == 48000 && opened.result.deviceChannels >= 10);
+  BusObservation wrappedObserved;
+  auto wrappedBackend = makeAlsaAudioInputBackendForTests("null", 10);
+  const AudioInputBusConfig wrappedSelection{"test-selected-bus",
+      {std::numeric_limits<uint32_t>::max()}};
+  CHECK(wrappedBackend->openBus(wrappedSelection, BusObservation::push,
+        &wrappedObserved).status == AudioInputBusOpenStatus::Error);
+  auto mono = makeAlsaAudioInputBackendForTests("null", 10);
+  MonoBusObservation monoObserved;
+  CHECK(mono->open({"test-selected-bus", 8, 32}, MonoBusObservation::push, &monoObserved).ok);
+  std::string error;
+  BusScript script;
+  auto operations = detail::acquireAlsaCapture("test-selected-bus", "null", 2, 48000, 256,
+      captureCount, &monoObserved.callbacks, error);
+  CHECK(operations);
+  operations->setOperationsForTests(BusScript::operation, &script);
+  CHECK(backend->start().ok && mono->start().ok);
+  CHECK(until([&] { return observed.callbacks >= 3 && monoObserved.callbacks >= 1; }));
+  CHECK(observed.qualities[0] == AudioInputTimestampQuality::Unknown && observed.first[0] == 0);
+  CHECK(observed.qualities[1] == AudioInputTimestampQuality::CallbackEstimate &&
+        observed.first[1] != 0 && observed.delivery[1] != 0);
+  CHECK(!observed.invalid.load(std::memory_order_relaxed) &&
+        !monoObserved.invalid.load(std::memory_order_relaxed));
+  CHECK(backend->suspendPrepared());
+  const auto suspended = observed.callbacks.load();
+  std::this_thread::sleep_for(5ms);
+  CHECK(observed.callbacks == suspended);
+  CHECK(backend->start().ok);
+  CHECK(until([&] { return observed.callbacks > suspended; }));
+  backend->stop();
+  const auto stopped = observed.callbacks.load();
+  std::this_thread::sleep_for(5ms);
+  CHECK(observed.callbacks == stopped);
+
+  BusObservation reopened;
+  opened = backend->openBus(selection, BusObservation::push, &reopened);
+  CHECK(opened.status == AudioInputBusOpenStatus::Ready && backend->start().ok);
+  CHECK(until([&] { return reopened.callbacks >= 1; }));
+  CHECK(observed.callbacks == stopped &&
+        !reopened.invalid.load(std::memory_order_relaxed));
+  const auto monoBefore = monoObserved.callbacks.load();
+  backend->stop();
+  CHECK(until([&] { return monoObserved.callbacks > monoBefore; }));
+  mono->stop();
+  const auto drained = reopened.callbacks.load();
+  std::this_thread::sleep_for(5ms);
+  CHECK(reopened.callbacks == drained);
 }
 struct CaptureRecoveryObservation {
   AudioInputRing ring{16, 256};
@@ -880,7 +1030,7 @@ int main(int argc, char** argv) {
     CHECK(argc == 1);
     conversion(); lifecycle(); shortTransfers(); recoveredUnderrun(); recoveryFailures();
     playbackTimestampMath(); outputStatusEstimates(); outputStatusUnavailableThenValid();
-    outputStatusXrunRecovery(); outputStatusTerminal(); leases();
+    outputStatusXrunRecovery(); outputStatusTerminal(); leases(); audioInputBus();
     captureRecovery(); captureRecoveryFailures(); captureTimestampConfiguration();
     captureTimestampMath(); captureTimestampDelay(); captureTimestampRecovery();
     captureTimestampApiFailure();
