@@ -109,10 +109,15 @@ uint32_t AudioResampler::read(ResamplePosition read, ResampleOutput output, uint
 
     // A nearly equal measured clock is still a fractional FIR read. The cached
     // reader preserves its phase/rate exactly and declines direct-copy frames.
-    if (linear_)
+    if (linear_) {
         if (const auto cached =
                 CachedFir::read(read, output, frames, *linear_, cutoff, getFrame, availableFrames))
             return *cached;
+        if (output.channels.size() <= 2)
+            if (const auto cached = CachedFir::readWindow<512, 2, false>(
+                    read, output, frames, *linear_, cutoff, getFrame, availableFrames))
+                return *cached;
+    }
 
     // A 32-frame output tile needs 16 KiB of double accumulators at 64
     // channels. Read each source frame once per tile, rather than rereading its

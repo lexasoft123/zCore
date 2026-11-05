@@ -282,11 +282,156 @@ void silenceChannelsAndRestart() {
     result=history.read(restart+ns(128,48000),48000,{out,64},64,cursor);
     CHECK(result.missingFrames==64);checkZero();
 }
+struct FirProvider {
+    uint64_t origin;
+    uint64_t reads = 0;
+    bool injectGaps = false;
+    uint64_t invalidAt = UINT64_MAX, shortAt = UINT64_MAX, nonfiniteAt = UINT64_MAX;
+    static ResampleFrame read(const void* context, uint64_t position,
+                              std::span<float> values) noexcept {
+        auto& self = *static_cast<FirProvider*>(const_cast<void*>(context));
+        ++self.reads;
+        if (self.injectGaps && position == self.invalidAt) return {false, 0};
+        const long double index = position >= self.origin
+            ? static_cast<long double>(position - self.origin)
+            : -static_cast<long double>(self.origin - position);
+        const long double time = index / 48000;
+        for (size_t channel = 0; channel < values.size(); ++channel) {
+            values[channel] = static_cast<float>(tone(time, static_cast<uint32_t>(channel)) +
+                .03L * std::cos(2 * std::numbers::pi_v<long double> * 31 * time + channel));
+        }
+        if (self.injectGaps && position == self.nonfiniteAt) {
+            values[0] = std::numeric_limits<float>::quiet_NaN();
+            if (values.size() > 1) values[1] = std::numeric_limits<float>::infinity();
+        }
+        return {true, self.injectGaps && position == self.shortAt
+                          ? 1u : static_cast<uint32_t>(values.size())};
+    }
+};
+struct FirCaseResult {
+    uint64_t optimizedReads, genericReads;
+    double maximumError, snr;
+};
+FirCaseResult checkFirCase(size_t channels, uint32_t frames, double sourceRate,
+                           long double offset, uint32_t stride, bool gaps,
+                           bool requireReduction, bool requireGenericReads,
+                           uint64_t anchor = 1000000000000ULL) {
+    CHECK(channels >= 1 && channels <= 2 && frames >= 32 && frames <= 256);
+    CHECK(stride >= 1 && stride <= 3);
+    FirProvider optimized{anchor}, generic{anchor};
+    if (gaps) {
+        optimized.injectGaps = generic.injectGaps = true;
+        optimized.invalidAt = generic.invalidAt = anchor + 4096 + 31;
+        optimized.shortAt = generic.shortAt = anchor + 4096 + 79;
+        optimized.nonfiniteAt = generic.nonfiniteAt = anchor + 4096 + 137;
+    }
+    constexpr size_t planeFrames = 260 * 3;
+    std::array<std::array<float, planeFrames>, 2> fullPlanes{}, referencePlanes{};
+    for (size_t channel = 0; channel < channels; ++channel) {
+        fullPlanes[channel].fill(99);
+        referencePlanes[channel].fill(99);
+    }
+    std::array<float*, 2> fullChannels{fullPlanes[0].data(), fullPlanes[1].data()};
+    std::array<float*, 2> referenceChannels{referencePlanes[0].data(), referencePlanes[1].data()};
+    const uint32_t capacity = frames + 4;
+    ResampleOutput fullOutput{std::span<float* const>(fullChannels.data(), channels),
+                              capacity, stride};
+    std::array<uint8_t, 256> fullAvailable{}, referenceAvailable{};
+    ResamplePosition position{};
+    position.anchor = anchor;
+    position.offset = offset;
+    position.sourceRate = sourceRate;
+    position.outputRate = 48000;
+    AudioResampler resampler;
+    const auto fullMissing = noHeap([&] {
+        return resampler.read(position, fullOutput, frames, FirProvider::read, &optimized,
+                              std::span<uint8_t>(fullAvailable.data(), frames));
+    });
+    uint32_t referenceMissing = 0;
+    const auto step = sourceRate / 48000;
+    for (uint32_t begin = 0; begin < frames; begin += 32) {
+        const auto length = std::min(frames - begin, 32u);
+        auto tileChannels = referenceChannels;
+        for (size_t channel = 0; channel < channels; ++channel)
+            tileChannels[channel] += begin * stride;
+        ResampleOutput tileOutput{std::span<float* const>(tileChannels.data(), channels), 36,
+                                  stride};
+        auto tilePosition = position;
+        tilePosition.offset = position.offset + static_cast<long double>(begin) * step;
+        referenceMissing += noHeap([&] {
+            return resampler.read(tilePosition, tileOutput, length, FirProvider::read, &generic,
+                                  std::span<uint8_t>(referenceAvailable).subspan(begin, length));
+        });
+    }
+    CHECK(fullMissing == referenceMissing);
+    for (uint32_t frame = 0; frame < frames; ++frame)
+        CHECK(fullAvailable[frame] == referenceAvailable[frame]);
+    double maximumError = 0, error = 0, energy = 0;
+    for (size_t channel = 0; channel < channels; ++channel) {
+        for (uint32_t frame = 0; frame < frames; ++frame) {
+            const auto actual = fullPlanes[channel][frame * stride];
+            const auto expected = referencePlanes[channel][frame * stride];
+            CHECK(std::isfinite(actual) && std::isfinite(expected));
+            const auto difference = static_cast<double>(actual) - expected;
+            maximumError = std::max(maximumError, std::abs(difference));
+            error += difference * difference;
+            energy += static_cast<double>(expected) * expected;
+        }
+        for (uint32_t frame = 0; frame < capacity; ++frame) {
+            for (uint32_t lane = 1; lane < stride; ++lane) {
+                CHECK(fullPlanes[channel][frame * stride + lane] == 99);
+                CHECK(referencePlanes[channel][frame * stride + lane] == 99);
+            }
+        }
+        for (uint32_t frame = frames; frame < capacity; ++frame) {
+            CHECK(fullPlanes[channel][frame * stride] == 99);
+            CHECK(referencePlanes[channel][frame * stride] == 99);
+        }
+    }
+    CHECK(maximumError <= .000002);
+    double snr = std::numeric_limits<double>::infinity();
+    if (energy == 0) CHECK(error == 0);
+    else {
+        snr = 10 * std::log10(energy / std::max(error, 1e-30));
+        CHECK(snr > 120);
+    }
+    CHECK(optimized.reads && generic.reads);
+    if (requireReduction) CHECK(optimized.reads * 2 < generic.reads);
+    if (requireGenericReads) CHECK(optimized.reads == generic.reads);
+    return {optimized.reads, generic.reads, maximumError, snr};
+}
+void cachedFirDispatch() {
+    constexpr long double offset = 4096.375L;
+    const auto mono = checkFirCase(1, 128, 48000 * 1.0002, offset, 1,
+                                   false, true, false);
+    const auto stereo = checkFirCase(2, 256, 48000 * .9998, offset, 2,
+                                     false, true, false);
+    checkFirCase(2, 256, 48000 * 1.000037, offset, 3, true, false, false,
+                 UINT64_MAX - 8192);
+    checkFirCase(1, 128, 48000 * .999947, offset, 2, true, false, false);
+    checkFirCase(2, 256, 96000, offset, 1, false, false, false);
+    checkFirCase(2, 256, 96000 * 1.01, offset, 1, false, false, true);
+    checkFirCase(2, 64, 48000 * 1.0002, offset, 1, false, false, true);
+    checkFirCase(2, 128, 48000, 4096.0001L, 1, false, false, true);
+    checkFirCase(1, 128, 48000, 4096.9999L, 1, false, false, true);
+    checkFirCase(1, 128, 48000 * 1.0002, -25.37L, 1, false, false, true, 128);
+    checkFirCase(2, 256, 48000 * 1.0002, .375L, 2, false, false, true,
+                 UINT64_MAX - 256);
+    checkFirCase(2, 256, 192000, 4096.375L, 1, false, true, false);
+    std::printf("Cached mono/stereo FIR: provider reads %llu -> %llu and %llu -> %llu\n",
+        static_cast<unsigned long long>(mono.genericReads),
+        static_cast<unsigned long long>(mono.optimizedReads),
+        static_cast<unsigned long long>(stereo.genericReads),
+        static_cast<unsigned long long>(stereo.optimizedReads));
+    std::printf("Mono maxError %.3g, SNR %.2f dB; stereo maxError %.3g, SNR %.2f dB\n",
+        mono.maximumError, mono.snr, stereo.maximumError, stereo.snr);
+}
 }
 int main() {
     driftingCaptureAndOutput();
     verifiedTimestampPhaseSteps();
     sustainedUnsupportedRateIsNotCorrected();
     silenceChannelsAndRestart();
+    cachedFirDispatch();
     std::puts("Capture history drift, phase steps, unsupported rates, restart and nonfinite checks passed");
 }
