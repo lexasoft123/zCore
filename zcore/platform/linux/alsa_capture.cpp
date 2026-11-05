@@ -1,4 +1,5 @@
 #include "alsa_pcm.h"
+#include "alsa_worker.h"
 
 #include <zcore/device/audio_input_callback_gate.h>
 
@@ -108,6 +109,7 @@ class __attribute__((visibility("hidden"))) AlsaCaptureRoute final {
     return false;
   }
   void run() noexcept {
+    prepareAlsaWorker("zcore-cap");
     while (!stopping.load(std::memory_order_acquire)) {
       const int ready = pcm.wait();
       if (stopping.load(std::memory_order_acquire)) break;

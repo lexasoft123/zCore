@@ -1,4 +1,5 @@
 #include "alsa_pcm.h"
+#include "alsa_worker.h"
 #include "../../src/device/audio_host_fifo.h"
 
 #include <algorithm>
@@ -309,6 +310,7 @@ class AlsaHost final : public AudioHostBackend {
     return true;
   }
   void run() noexcept {
+    detail::prepareAlsaWorker("zcore-out");
     previousOutputTimestampNs_ = 0;
     previousOutputHostTimeNs_ = 0;
     snd_pcm_status_t* status = nullptr;
