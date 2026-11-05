@@ -29,6 +29,17 @@ uint64_t alsaTimespecMonotonicNs(const snd_htimestamp_t& time) noexcept;
 uint64_t alsaCaptureFirstSampleNs(const AlsaCaptureSnapshot& snapshot,
     uint32_t rate, uint32_t bufferFrames, uint64_t previousTimestampNs,
     uint64_t previousFirstSampleNs) noexcept;
+struct AlsaPlaybackSnapshot {
+  snd_pcm_state_t state{SND_PCM_STATE_RUNNING};
+  snd_pcm_uframes_t available{0};
+  snd_htimestamp_t time{};
+  snd_pcm_sframes_t delay{0};
+};
+// Delay above bufferFrames can be valid ALSA pipeline latency, but is outside
+// the supported presentation budget and intentionally yields no estimate.
+uint64_t alsaPlaybackOutputHostNs(const AlsaPlaybackSnapshot& snapshot,
+    uint32_t rate, uint32_t bufferFrames, uint64_t previousTimestampNs,
+    uint64_t previousOutputHostNs) noexcept;
 uint32_t alsaDecode(const unsigned char* source, float* target, uint32_t samples,
                 snd_pcm_format_t format) noexcept;
 uint32_t alsaEncode(const float* source, unsigned char* target, uint32_t samples,
@@ -101,12 +112,14 @@ enum class AlsaOutputRecoveryOperation { Prepare, Write, Start };
 using AlsaWriteForTest = snd_pcm_sframes_t (*)(void*, const void*, snd_pcm_uframes_t);
 using AlsaOutputRecoveryForTest = snd_pcm_sframes_t (*)(
     void*, AlsaOutputRecoveryOperation, const void*, snd_pcm_uframes_t);
+using AlsaOutputStatusForTest = int (*)(void*, AlsaPlaybackSnapshot&);
 // Named ALSA plugins are allowed only at this private test seam. Production
 // resolves opaque inventory UIDs to direct hardware endpoints.
 std::unique_ptr<AudioHostBackend> makeAlsaAudioHostForTests(
     std::string outputPcm, std::string inputPcm = {},
     AlsaWriteForTest write = nullptr, void* writeContext = nullptr,
-    AlsaOutputRecoveryForTest recover = nullptr);
+    AlsaOutputRecoveryForTest recover = nullptr,
+    AlsaOutputStatusForTest status = nullptr);
 #endif
 
 }  // namespace singz::detail

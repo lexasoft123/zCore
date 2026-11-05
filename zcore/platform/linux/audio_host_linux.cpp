@@ -190,6 +190,7 @@ class AlsaHost final : public AudioHostBackend {
   std::string testOutput_, testInput_;
   detail::AlsaWriteForTest testWrite_{nullptr};
   detail::AlsaOutputRecoveryForTest testRecovery_{nullptr};
+  detail::AlsaOutputStatusForTest testStatus_{nullptr};
   void* testWriteContext_{nullptr};
 #endif
  private:
@@ -215,6 +216,31 @@ class AlsaHost final : public AudioHostBackend {
         frames, discontinuity, timestampValid, false};
     return self.fifo_.writeInterleavedFloat(input, channels,
         self.config_.inputChannels.data(), frames, span, false);
+  }
+  int outputStatus(snd_pcm_status_t* status,
+      detail::AlsaPlaybackSnapshot& snapshot) noexcept {
+    int result = 0;
+#if defined(SINGZ_CORE_TESTS)
+    if (testStatus_) result = testStatus_(testWriteContext_, snapshot);
+    else
+#endif
+    {
+      result = snd_pcm_status(pcm_.handle, status);
+      if (result >= 0) {
+        snapshot.state = snd_pcm_status_get_state(status);
+        snapshot.available = snd_pcm_status_get_avail(status);
+        snd_pcm_status_get_htstamp(status, &snapshot.time);
+        snapshot.delay = snd_pcm_status_get_delay(status);
+      }
+    }
+    if (result < 0) return result;
+    switch (snapshot.state) {
+      case SND_PCM_STATE_RUNNING: return 0;
+      case SND_PCM_STATE_XRUN: return -EPIPE;
+      case SND_PCM_STATE_SUSPENDED: return -ESTRPIPE;
+      case SND_PCM_STATE_DISCONNECTED: return -ENODEV;
+      default: return -EIO;
+    }
   }
   snd_pcm_sframes_t outputOperation(bool recovery,
       detail::AlsaOutputRecoveryOperation operation, const void* data,
@@ -278,9 +304,15 @@ class AlsaHost final : public AudioHostBackend {
     }
     nextDiscontinuity_ |= AudioHostDiscontinuityXRun |
         AudioHostDiscontinuityClockReanchored;
+    previousOutputTimestampNs_ = 0;
+    previousOutputHostTimeNs_ = 0;
     return true;
   }
   void run() noexcept {
+    previousOutputTimestampNs_ = 0;
+    previousOutputHostTimeNs_ = 0;
+    snd_pcm_status_t* status = nullptr;
+    snd_pcm_status_alloca(&status);
     uint32_t pending = 0, offset = 0;
     while (!stopping_.load(std::memory_order_acquire)) {
       if (capture_ && capture_->failure()) { terminal(capture_->failure()); break; }
@@ -292,13 +324,14 @@ class AlsaHost final : public AudioHostBackend {
       }
       if (!ready) continue;
       if (!pending) {
-        const auto available = snd_pcm_avail_update(pcm_.handle);
-        if (available == -EAGAIN || available == -EINTR) continue;
-        if (available < 0) {
-          if (handleOutputFailure(int(available))) continue;
+        detail::AlsaPlaybackSnapshot snapshot;
+        const int sampled = outputStatus(status, snapshot);
+        if (sampled == -EAGAIN || sampled == -EINTR) continue;
+        if (sampled < 0) {
+          if (handleOutputFailure(sampled)) continue;
           break;
         }
-        if (available < pcm_.period) continue;
+        if (snapshot.available < pcm_.period) continue;
         std::fill(output_.begin(), output_.end(), 0);
         AudioHostRenderBlock block;
         block.output = outputPointers_.data(); block.outputChannels = format_.outputChannels;
@@ -308,12 +341,15 @@ class AlsaHost final : public AudioHostBackend {
         block.callbackSequence = callbacks_.load(std::memory_order_relaxed);
         block.outputFrame = frames_.load(std::memory_order_relaxed);
         block.callbackHostTimeNs = detail::alsaMonotonicNs();
-        snd_pcm_sframes_t queued = 0;
-        if (snd_pcm_delay(pcm_.handle, &queued) == 0 && queued >= 0) {
-          block.outputHostTimeNs = block.callbackHostTimeNs +
-              uint64_t(double(queued) * 1e9 / format_.sampleRate);
-          block.outputTimestampValid = true;
-          block.outputTimestampHardware = false;
+        block.outputTimestampHardware = false;
+        const uint64_t outputHostNs = detail::alsaPlaybackOutputHostNs(snapshot,
+            uint32_t(format_.sampleRate), pcm_.buffer,
+            previousOutputTimestampNs_, previousOutputHostTimeNs_);
+        block.outputTimestampValid = outputHostNs != 0;
+        if (outputHostNs) {
+          block.outputHostTimeNs = outputHostNs;
+          previousOutputTimestampNs_ = detail::alsaTimespecMonotonicNs(snapshot.time);
+          previousOutputHostTimeNs_ = outputHostNs;
         }
         block.discontinuity = nextDiscontinuity_;
         nextDiscontinuity_ = AudioHostDiscontinuityNone;
@@ -375,6 +411,7 @@ class AlsaHost final : public AudioHostBackend {
   std::atomic<uint64_t> nonFinite_{0};
   AudioHostTerminalCauseLatch terminal_;
   uint64_t generation_{0}, clock_{0};
+  uint64_t previousOutputTimestampNs_{0}, previousOutputHostTimeNs_{0};
   uint32_t nextDiscontinuity_{AudioHostDiscontinuityStart};
 };
 }
@@ -386,11 +423,11 @@ namespace detail {
 std::unique_ptr<AudioHostBackend> makeAlsaAudioHostForTests(
     std::string outputPcm, std::string inputPcm,
     AlsaWriteForTest write, void* writeContext,
-    AlsaOutputRecoveryForTest recover) {
+    AlsaOutputRecoveryForTest recover, AlsaOutputStatusForTest status) {
   auto host = std::make_unique<AlsaHost>();
   host->testOutput_ = std::move(outputPcm); host->testInput_ = std::move(inputPcm);
   host->testWrite_ = write; host->testWriteContext_ = writeContext;
-  host->testRecovery_ = recover;
+  host->testRecovery_ = recover; host->testStatus_ = status;
   return host;
 }
 }

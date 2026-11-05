@@ -51,6 +51,25 @@ uint64_t alsaCaptureFirstSampleNs(const AlsaCaptureSnapshot& snapshot,
       (previousFirstSampleNs && firstSampleNs <= previousFirstSampleNs)) return 0;
   return firstSampleNs;
 }
+uint64_t alsaPlaybackOutputHostNs(const AlsaPlaybackSnapshot& snapshot,
+    uint32_t rate, uint32_t bufferFrames, uint64_t previousTimestampNs,
+    uint64_t previousOutputHostNs) noexcept {
+  const uint64_t timestampNs = alsaTimespecMonotonicNs(snapshot.time);
+  if (!timestampNs || timestampNs < previousTimestampNs || !rate || !bufferFrames ||
+      snapshot.delay < 0) return 0;
+  // Budget policy, not an ALSA validity rule. Larger driver latency remains
+  // unavailable rather than falling back to callback time or a guessed bound.
+  if (static_cast<uint64_t>(snapshot.delay) > bufferFrames) return 0;
+  const long double delay = static_cast<long double>(snapshot.delay) * 1e9L / rate;
+  const auto maximum = std::numeric_limits<uint64_t>::max();
+  if (!std::isfinite(delay) || delay < 0 || delay > maximum) return 0;
+  const auto delayNs = static_cast<uint64_t>(delay);
+  if (timestampNs > maximum - delayNs) return 0;
+  const uint64_t outputHostNs = timestampNs + delayNs;
+  if (!outputHostNs || (previousOutputHostNs && outputHostNs <= previousOutputHostNs))
+    return 0;
+  return outputHostNs;
+}
 namespace {
 bool pcmError(int result, std::string& error) {
   if (result >= 0) return false;
@@ -289,22 +308,19 @@ bool AlsaPcm::open(const std::string& name, bool capture, uint32_t needed,
       fail(snd_pcm_sw_params_get_boundary(software, &boundary)) ||
       fail(snd_pcm_sw_params_set_start_threshold(handle, software, boundary)) ||
       fail(snd_pcm_sw_params_set_avail_min(handle, software, period)) ||
-      (capture && fail(snd_pcm_sw_params_set_tstamp_mode(
-          handle, software, SND_PCM_TSTAMP_ENABLE))) ||
-      (capture && fail(snd_pcm_sw_params_set_tstamp_type(
-          handle, software, SND_PCM_TSTAMP_TYPE_MONOTONIC))) ||
+      fail(snd_pcm_sw_params_set_tstamp_mode(handle, software, SND_PCM_TSTAMP_ENABLE)) ||
+      fail(snd_pcm_sw_params_set_tstamp_type(
+          handle, software, SND_PCM_TSTAMP_TYPE_MONOTONIC)) ||
       fail(snd_pcm_sw_params(handle, software))) return false;
-  if (capture) {
-    snd_pcm_tstamp_t mode = SND_PCM_TSTAMP_NONE;
-    snd_pcm_tstamp_type_t type = SND_PCM_TSTAMP_TYPE_GETTIMEOFDAY;
-    if (fail(snd_pcm_sw_params_current(handle, software)) ||
-        fail(snd_pcm_sw_params_get_tstamp_mode(software, &mode)) ||
-        fail(snd_pcm_sw_params_get_tstamp_type(software, &type))) return false;
-    if (mode != SND_PCM_TSTAMP_ENABLE || type != SND_PCM_TSTAMP_TYPE_MONOTONIC) {
-      error = "ALSA capture did not retain monotonic timestamp configuration";
-      close();
-      return false;
-    }
+  snd_pcm_tstamp_t mode = SND_PCM_TSTAMP_NONE;
+  snd_pcm_tstamp_type_t type = SND_PCM_TSTAMP_TYPE_GETTIMEOFDAY;
+  if (fail(snd_pcm_sw_params_current(handle, software)) ||
+      fail(snd_pcm_sw_params_get_tstamp_mode(software, &mode)) ||
+      fail(snd_pcm_sw_params_get_tstamp_type(software, &type))) return false;
+  if (mode != SND_PCM_TSTAMP_ENABLE || type != SND_PCM_TSTAMP_TYPE_MONOTONIC) {
+    error = "ALSA PCM did not retain monotonic timestamp configuration";
+    close();
+    return false;
   }
   const int count = snd_pcm_poll_descriptors_count(handle);
   if (count <= 0 || count > 64) {

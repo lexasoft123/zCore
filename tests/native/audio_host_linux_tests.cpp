@@ -127,6 +127,11 @@ struct ShortWrites {
   uint64_t frame{0}, failureFrame{4096}, primed{0};
   uint32_t calls{0}, interrupted{0}, recoveryBlocks{0};
   uint32_t recoveryPrepares{0}, recoveryWrites{0}, recoveryStarts{0};
+  uint32_t renders{0}, statusCalls{0}, statusCount{0}, statusSleepMs{0};
+  std::array<detail::AlsaPlaybackSnapshot, 8> statusSnapshots{};
+  std::array<int, 8> statusResults{};
+  std::array<uint64_t, 8> outputTimes{}, callbackTimes{};
+  std::array<bool, 8> outputValid{}, outputHardware{};
   bool invalid{false}, oneShot{false}, injected{false};
   bool failRestart{false};
   int failure{-EPIPE};
@@ -134,6 +139,13 @@ struct ShortWrites {
   snd_pcm_sframes_t restartFailure{-EIO};
   static bool render(void* context, const AudioHostRenderBlock& block) noexcept {
     auto& self = *static_cast<ShortWrites*>(context);
+    const auto index = self.renders++;
+    if (index < self.outputTimes.size()) {
+      self.outputTimes[index] = block.outputHostTimeNs;
+      self.callbackTimes[index] = block.callbackHostTimeNs;
+      self.outputValid[index] = block.outputTimestampValid;
+      self.outputHardware[index] = block.outputTimestampHardware;
+    }
     const auto discontinuity = block.discontinuity &
         (AudioHostDiscontinuityXRun | AudioHostDiscontinuityClockReanchored);
     if (discontinuity) {
@@ -185,6 +197,19 @@ struct ShortWrites {
     const auto accepted = std::min<snd_pcm_uframes_t>(13, frames);
     self.primed += accepted;
     return accepted;
+  }
+  static int status(void* context, detail::AlsaPlaybackSnapshot& snapshot) {
+    auto& self = *static_cast<ShortWrites*>(context);
+    if (!self.statusCount) {
+      self.invalid = true;
+      return -ENOSYS;
+    }
+    if (self.statusCalls >= self.statusCount) return -EAGAIN;
+    const auto index = self.statusCalls++;
+    snapshot = self.statusSnapshots[index];
+    if (self.statusSleepMs)
+      std::this_thread::sleep_for(std::chrono::milliseconds(self.statusSleepMs));
+    return self.statusResults[index];
   }
 };
 void shortTransfers() {
@@ -246,6 +271,123 @@ void recoveryFailures() {
     CHECK(observed.recoveryStarts == uint32_t(operation == ShortWrites::Operation::Start));
     CHECK(observed.primed == (operation == ShortWrites::Operation::Start ? buffer : 0));
     CHECK(!observed.invalid);
+  }
+}
+detail::AlsaPlaybackSnapshot outputSnapshot(uint64_t timestampNs,
+    snd_pcm_sframes_t delay = 256) {
+  detail::AlsaPlaybackSnapshot result;
+  result.available = 1024;
+  result.time.tv_sec = static_cast<decltype(result.time.tv_sec)>(
+      timestampNs / 1000000000ull);
+  result.time.tv_nsec = static_cast<decltype(result.time.tv_nsec)>(
+      timestampNs % 1000000000ull);
+  result.delay = delay;
+  return result;
+}
+void playbackTimestampMath() {
+  const auto snapshot = outputSnapshot(100000000000ull);
+  constexpr uint64_t expected = 100005333333ull;
+  CHECK(detail::alsaPlaybackOutputHostNs(snapshot, 48000, 1024, 0, 0) == expected);
+  CHECK(detail::alsaPlaybackOutputHostNs(snapshot, 48000, 1024,
+      100000000000ull, expected) == 0);
+  CHECK(detail::alsaPlaybackOutputHostNs(snapshot, 48000, 1024,
+      100000000001ull, 0) == 0);
+  CHECK(detail::alsaPlaybackOutputHostNs(snapshot, 48000, 1024,
+      0, expected + 1) == 0);
+  const auto sameTimeMoreQueued = outputSnapshot(100000000000ull, 512);
+  CHECK(detail::alsaPlaybackOutputHostNs(sameTimeMoreQueued, 48000, 1024,
+      100000000000ull, expected) == 100010666666ull);
+  const auto advanced = outputSnapshot(100010000000ull);
+  CHECK(detail::alsaPlaybackOutputHostNs(advanced, 48000, 1024,
+      100000000000ull, expected) == 100015333333ull);
+  const auto atBudget = outputSnapshot(100000000000ull, 1024);
+  CHECK(detail::alsaPlaybackOutputHostNs(atBudget, 48000, 1024, 0, 0) == 100021333333ull);
+  const auto zero = outputSnapshot(0);
+  CHECK(detail::alsaPlaybackOutputHostNs(zero, 48000, 1024, 0, 0) == 0);
+  CHECK(detail::alsaPlaybackOutputHostNs(zero, 48000, 1024,
+      100000000000ull, expected) == 0);
+  const auto negativeDelay = outputSnapshot(100000000000ull, -1);
+  CHECK(detail::alsaPlaybackOutputHostNs(negativeDelay, 48000, 1024, 0, 0) == 0);
+  const auto unsupportedLookahead = outputSnapshot(100000000000ull, 1025);
+  CHECK(detail::alsaPlaybackOutputHostNs(unsupportedLookahead, 48000, 1024, 0, 0) == 0);
+  CHECK(detail::alsaPlaybackOutputHostNs(snapshot, 0, 1024, 0, 0) == 0);
+  CHECK(detail::alsaPlaybackOutputHostNs(snapshot, 48000, 0, 0, 0) == 0);
+  const auto overflow = outputSnapshot(std::numeric_limits<uint64_t>::max() - 1000);
+  CHECK(detail::alsaPlaybackOutputHostNs(overflow, 48000, 1024, 0, 0) == 0);
+}
+void outputStatusEstimates() {
+  ShortWrites observed;
+  observed.statusCount = 2;
+  observed.statusSnapshots[0] = outputSnapshot(100000000000ull);
+  observed.statusSnapshots[1] = outputSnapshot(100010000000ull);
+  observed.statusSleepMs = 2;
+  AudioHost host(detail::makeAlsaAudioHostForTests(
+      "null", {}, ShortWrites::write, &observed, nullptr, ShortWrites::status));
+  CHECK(host.open(config(), ShortWrites::render, &observed).ok && host.start().ok);
+  CHECK(until([&] { return host.status().callbacks >= 2; }));
+  CHECK(host.status().state == AudioHostState::Running);
+  host.stop();
+  CHECK(observed.renders == 2 && observed.statusCalls >= 2 && !observed.invalid);
+  CHECK(observed.outputValid[0] && observed.outputValid[1] &&
+      !observed.outputHardware[0] && !observed.outputHardware[1]);
+  CHECK(observed.outputTimes[0] == 100005333333ull &&
+      observed.outputTimes[1] == 100015333333ull);
+  CHECK(observed.callbackTimes[0] && observed.callbackTimes[1] &&
+      observed.callbackTimes[0] != observed.callbackTimes[1]);
+}
+void outputStatusUnavailableThenValid() {
+  ShortWrites observed;
+  observed.statusCount = 2;
+  observed.statusSnapshots[0] = outputSnapshot(100000000000ull, 1025);
+  observed.statusSnapshots[1] = outputSnapshot(100000000000ull);
+  AudioHost host(detail::makeAlsaAudioHostForTests(
+      "null", {}, ShortWrites::write, &observed, nullptr, ShortWrites::status));
+  CHECK(host.open(config(), ShortWrites::render, &observed).ok && host.start().ok);
+  CHECK(until([&] { return host.status().callbacks >= 2; }));
+  CHECK(host.status().state == AudioHostState::Running);
+  host.stop();
+  CHECK(observed.renders == 2 && !observed.invalid);
+  CHECK(!observed.outputValid[0] && observed.outputTimes[0] == 0 &&
+      observed.callbackTimes[0] != 0);
+  CHECK(observed.outputValid[1] && observed.outputTimes[1] == 100005333333ull &&
+      !observed.outputHardware[0] && !observed.outputHardware[1]);
+}
+void outputStatusXrunRecovery() {
+  ShortWrites observed;
+  observed.statusCount = 2;
+  observed.statusSnapshots[0] = outputSnapshot(100000000000ull, 0);
+  observed.statusSnapshots[0].state = SND_PCM_STATE_XRUN;
+  observed.statusSnapshots[0].available = 0;
+  observed.statusSnapshots[1] = outputSnapshot(100000000000ull);
+  AudioHost host(detail::makeAlsaAudioHostForTests(
+      "null", {}, ShortWrites::write, &observed, ShortWrites::recover,
+      ShortWrites::status));
+  CHECK(host.open(config(), ShortWrites::render, &observed).ok && host.start().ok);
+  CHECK(until([&] { return host.status().xruns == 1 && host.status().callbacks >= 1; }));
+  CHECK(host.status().state == AudioHostState::Running);
+  CHECK(host.status().terminalReason == AudioHostTerminalReason::None);
+  host.stop();
+  CHECK(observed.renders == 1 && observed.recoveryPrepares == 1 &&
+      observed.recoveryStarts == 1 && observed.recoveryBlocks == 1);
+  CHECK(observed.outputValid[0] && observed.outputTimes[0] == 100005333333ull &&
+      !observed.invalid);
+}
+void outputStatusTerminal() {
+  for (const auto state : {SND_PCM_STATE_SUSPENDED, SND_PCM_STATE_DISCONNECTED,
+       static_cast<snd_pcm_state_t>(999)}) {
+    ShortWrites observed;
+    observed.statusCount = 1;
+    observed.statusSnapshots[0] = outputSnapshot(100000000000ull, 0);
+    observed.statusSnapshots[0].state = state;
+    observed.statusSnapshots[0].available = 0;
+    AudioHost host(detail::makeAlsaAudioHostForTests(
+        "null", {}, ShortWrites::write, &observed, nullptr, ShortWrites::status));
+    CHECK(host.open(config(), ShortWrites::render, &observed).ok && host.start().ok);
+    const auto expected = state == SND_PCM_STATE_DISCONNECTED ?
+        AudioHostState::DeviceLost : AudioHostState::Error;
+    CHECK(until([&] { return host.status().state == expected; }));
+    host.stop();
+    CHECK(observed.renders == 0 && host.status().callbacks == 0 && !observed.invalid);
   }
 }
 bool captureCount(void* context, const float*, uint32_t, uint32_t,
@@ -462,6 +604,10 @@ void captureTimestampConfiguration() {
   CHECK(mode == SND_PCM_TSTAMP_ENABLE && type == SND_PCM_TSTAMP_TYPE_MONOTONIC);
   detail::AlsaPcm output;
   CHECK(output.open("null", false, 2, 48000, 256, 1024, error));
+  CHECK(snd_pcm_sw_params_current(output.handle, software) == 0);
+  CHECK(snd_pcm_sw_params_get_tstamp_mode(software, &mode) == 0);
+  CHECK(snd_pcm_sw_params_get_tstamp_type(software, &type) == 0);
+  CHECK(mode == SND_PCM_TSTAMP_ENABLE && type == SND_PCM_TSTAMP_TYPE_MONOTONIC);
 }
 void captureTimestampMath() {
   detail::AlsaCaptureSnapshot snapshot;
@@ -732,7 +878,9 @@ int main(int argc, char** argv) {
   if (argc == 3 && std::string(argv[1]) == "--loopback") loopback(argv[2]);
   else {
     CHECK(argc == 1);
-    conversion(); lifecycle(); shortTransfers(); recoveredUnderrun(); recoveryFailures(); leases();
+    conversion(); lifecycle(); shortTransfers(); recoveredUnderrun(); recoveryFailures();
+    playbackTimestampMath(); outputStatusEstimates(); outputStatusUnavailableThenValid();
+    outputStatusXrunRecovery(); outputStatusTerminal(); leases();
     captureRecovery(); captureRecoveryFailures(); captureTimestampConfiguration();
     captureTimestampMath(); captureTimestampDelay(); captureTimestampRecovery();
     captureTimestampApiFailure();
