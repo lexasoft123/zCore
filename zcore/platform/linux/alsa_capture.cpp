@@ -104,7 +104,10 @@ class __attribute__((visibility("hidden"))) AlsaCaptureRoute final {
     return true;
   }
   bool handleFailure(int error) noexcept {
-    if (error == -EPIPE) return recoverOverrun();
+    if (error == -EPIPE) {
+      xruns.fetch_add(1, std::memory_order_relaxed);
+      return recoverOverrun();
+    }
     failure.store(error, std::memory_order_release);
     return false;
   }
@@ -163,7 +166,7 @@ class __attribute__((visibility("hidden"))) AlsaCaptureRoute final {
   std::thread worker;
   std::atomic<bool> stopping{true};
   std::atomic<int> failure{0};
-  std::atomic<uint64_t> nonFinite{0};
+  std::atomic<uint64_t> nonFinite{0}, xruns{0};
   uint64_t sourceFrame{0};
   uint64_t previousTimestampNs{0}, previousFirstSampleNs{0};
   bool invalidateTimestamp{false};
@@ -231,6 +234,9 @@ uint32_t AlsaCaptureLease::period() const noexcept { return route_->pcm.period; 
 uint32_t AlsaCaptureLease::bufferFrames() const noexcept { return route_->pcm.buffer; }
 uint64_t AlsaCaptureLease::nonFiniteSamples() const noexcept {
   return route_->nonFinite.load(std::memory_order_relaxed);
+}
+uint64_t AlsaCaptureLease::xruns() const noexcept {
+  return route_->xruns.load(std::memory_order_relaxed);
 }
 #if defined(SINGZ_CORE_TESTS)
 void AlsaCaptureLease::setOperationsForTests(

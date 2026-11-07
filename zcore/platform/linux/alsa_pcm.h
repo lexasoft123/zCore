@@ -88,6 +88,7 @@ class __attribute__((visibility("hidden"))) AlsaCaptureLease final {
   uint32_t period() const noexcept;
   uint32_t bufferFrames() const noexcept;
   uint64_t nonFiniteSamples() const noexcept;
+  uint64_t xruns() const noexcept;
 #if defined(SINGZ_CORE_TESTS)
   void setOperationsForTests(
       snd_pcm_sframes_t (*)(void*, AlsaCaptureOperation, void*, snd_pcm_uframes_t),

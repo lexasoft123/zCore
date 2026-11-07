@@ -502,7 +502,8 @@ void audioInputBus() {
   invalid.channels = {};
   CHECK(backend->openBus(invalid, BusObservation::push, &observed).status ==
         AudioInputBusOpenStatus::Error);
-  invalid.channels = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+  invalid.channels.resize(kAudioInputBusMaxChannels + 1);
+  for (uint32_t c = 0; c < invalid.channels.size(); ++c) invalid.channels[c] = c;
   CHECK(backend->openBus(invalid, BusObservation::push, &observed).status ==
         AudioInputBusOpenStatus::Error);
   invalid.channels = {10};
@@ -651,6 +652,147 @@ struct CaptureRecoveryScript {
     return accepted;
   }
 };
+struct WideBusObservation {
+  uint32_t channels{0};
+  bool rejectThird{false};
+  std::atomic<uint32_t> callbacks{0};
+  std::atomic<bool> invalid{false};
+  std::array<AudioInputCaptureMetadata, 16> metadata{};
+  std::array<uint64_t, 16> xruns{};
+  std::atomic<uint64_t> latestGeneration{0};
+  static bool push(void* context, const AudioInputBusBlock& block) noexcept {
+    auto& self = *static_cast<WideBusObservation*>(context);
+    const auto index = self.callbacks.load(std::memory_order_relaxed);
+    if (!block.planes || block.channelCount != self.channels || !block.frames ||
+        block.frames > block.capacityFrames || block.capacityFrames > 256)
+      self.invalid.store(true, std::memory_order_relaxed);
+    else
+      for (uint32_t channel = 0; channel < self.channels; ++channel)
+        if (!block.planes[channel] ||
+            std::abs(block.planes[channel][0] - float(channel + 1) / 100.f) > .00001f)
+          self.invalid.store(true, std::memory_order_relaxed);
+    if (!block.capture.clockDomainId || !block.capture.streamGeneration ||
+        block.capture.sourceFrame % 64 || (block.capture.flags & AudioInputSourceFrameValid) == 0 ||
+        block.capture.sampleHostTimeNs != block.firstNs ||
+        block.capture.timestampQuality != block.quality)
+      self.invalid.store(true, std::memory_order_relaxed);
+    if (index < self.metadata.size()) {
+      self.metadata[index] = block.capture;
+      self.xruns[index] = block.xruns;
+    }
+    self.latestGeneration.store(block.capture.streamGeneration, std::memory_order_relaxed);
+    self.callbacks.store(index + 1, std::memory_order_release);
+    return !(self.rejectThird && index == 2);
+  }
+};
+struct WideBusScript {
+  uint32_t channels, reads{0}, injections{0}, injectAfter{0};
+  static snd_pcm_sframes_t operation(void* context, detail::AlsaCaptureOperation action, void* data,
+                                     snd_pcm_uframes_t frames) {
+    auto& self = *static_cast<WideBusScript*>(context);
+    if (action == detail::AlsaCaptureOperation::Timestamp) {
+      auto& snapshot = *static_cast<detail::AlsaCaptureSnapshot*>(data);
+      const uint64_t timestamp = 100000000000ull + uint64_t(self.reads) * 1333334;
+      snapshot.available = 64;
+      snapshot.time.tv_sec = static_cast<decltype(snapshot.time.tv_sec)>(timestamp / 1000000000ull);
+      snapshot.time.tv_nsec =
+          static_cast<decltype(snapshot.time.tv_nsec)>(timestamp % 1000000000ull);
+      return 0;
+    }
+    if (action != detail::AlsaCaptureOperation::Read) return 0;
+    if (self.injections && self.reads >= self.injectAfter) {
+      --self.injections;
+      return -EPIPE;
+    }
+    ++self.reads;
+    const auto accepted = std::min<snd_pcm_uframes_t>(64, frames);
+    auto* samples = static_cast<float*>(data);
+    for (uint32_t frame = 0; frame < accepted; ++frame)
+      for (uint32_t channel = 0; channel < self.channels; ++channel)
+        samples[size_t(frame) * self.channels + channel] = float(channel + 1) / 100.f;
+    return accepted;
+  }
+};
+void wideCaptureBus() {
+  for (uint32_t channels : {10u, kAudioInputBusMaxChannels}) {
+    const auto uid = "test-wide-bus-" + std::to_string(channels);
+    auto backend = makeAlsaAudioInputBackendForTests("null", channels);
+    AudioInputBusConfig selection{uid, {}};
+    selection.channels.resize(channels);
+    for (uint32_t channel = 0; channel < channels; ++channel) selection.channels[channel] = channel;
+    WideBusObservation observed;
+    observed.channels = channels;
+    observed.rejectThird = true;
+    CHECK(backend->openBus(selection, WideBusObservation::push, &observed).status ==
+          AudioInputBusOpenStatus::Ready);
+    std::atomic<uint32_t> physical{0};
+    std::string error;
+    auto operations = detail::acquireAlsaCapture(uid, "null", channels, 48000, 256, captureCount,
+                                                 &physical, error);
+    CHECK(operations);
+    WideBusScript script{channels};
+    operations->setOperationsForTests(WideBusScript::operation, &script);
+    CHECK(backend->start().ok && operations->start(error));
+    CHECK(until([&] { return observed.callbacks >= 5 && physical >= 5; }));
+    CHECK(backend->suspendPrepared());
+    const auto stopped = observed.callbacks.load();
+    const auto physicalBefore = physical.load();
+    CHECK(until([&] { return physical > physicalBefore; }));
+    CHECK(observed.callbacks == stopped && !observed.invalid);
+    CHECK(observed.metadata[0].sequence == 0 && observed.metadata[1].sequence == 1);
+    CHECK(observed.metadata[1].sourceFrame == observed.metadata[0].sourceFrame + 64);
+    CHECK(observed.metadata[0].streamGeneration == observed.metadata[1].streamGeneration);
+    CHECK(observed.metadata[0].discontinuity ==
+          AudioInputDiscontinuityReason::StreamGenerationChanged);
+    CHECK(observed.metadata[3].sequence == 3 &&
+          observed.metadata[3].sourceFrame == observed.metadata[2].sourceFrame + 64);
+    CHECK(observed.metadata[3].discontinuity == AudioInputDiscontinuityReason::SequenceGap);
+    const auto initialGeneration = observed.metadata[0].streamGeneration;
+    const auto beforeResume = observed.latestGeneration.load();
+    CHECK(backend->start().ok && until([&] { return observed.callbacks > stopped + 1; }));
+    CHECK(backend->suspendPrepared());
+    CHECK(observed.latestGeneration.load() != beforeResume);
+    // Restart only this subscriber: the physical peer must keep running.
+    WideBusObservation resumed;
+    resumed.channels = channels;
+    backend->stop();
+    CHECK(backend->openBus(selection, WideBusObservation::push, &resumed).status ==
+          AudioInputBusOpenStatus::Ready);
+    CHECK(backend->start().ok && until([&] { return resumed.callbacks >= 2; }));
+    backend->stop();
+    CHECK(resumed.metadata[0].streamGeneration != initialGeneration &&
+          resumed.metadata[0].sequence == 0 && !resumed.invalid);
+    operations->stop();
+  }
+  // Two recovered EPIPE events must survive the bus boundary independently
+  // of timestamp quality, with no fabricated count of missing physical frames.
+  const std::string uid = "test-wide-bus-recovery";
+  auto backend = makeAlsaAudioInputBackendForTests("null", 10);
+  AudioInputBusConfig selection{uid, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}};
+  WideBusObservation observed;
+  observed.channels = 10;
+  CHECK(backend->openBus(selection, WideBusObservation::push, &observed).status ==
+        AudioInputBusOpenStatus::Ready);
+  std::string error;
+  std::atomic<uint32_t> unused{0};
+  auto operations =
+      detail::acquireAlsaCapture(uid, "null", 10, 48000, 256, captureCount, &unused, error);
+  CHECK(operations);
+  WideBusScript script{10, 0, 2, 2};
+  operations->setOperationsForTests(WideBusScript::operation, &script);
+  CHECK(backend->start().ok && until([&] { return observed.callbacks >= 5; }));
+  backend->stop();
+  CHECK(!observed.invalid && observed.xruns[0] == 0 && observed.xruns[2] == 2 &&
+        operations->xruns() == 2);
+  CHECK(observed.metadata[2].sourceFrame == 128 && observed.metadata[2].sequence == 2);
+  CHECK(observed.metadata[2].streamGeneration != observed.metadata[1].streamGeneration);
+  CHECK(observed.metadata[2].discontinuity == AudioInputDiscontinuityReason::ClockReanchored &&
+        observed.metadata[2].sampleHostTimeNs == 0 &&
+        observed.metadata[2].timestampQuality == AudioInputTimestampQuality::Unknown);
+  CHECK(observed.metadata[3].streamGeneration == observed.metadata[2].streamGeneration &&
+        observed.metadata[3].timestampQuality == AudioInputTimestampQuality::CallbackEstimate);
+}
+
 void captureRecovery() {
   CaptureRecoveryObservation firstObserved, secondObserved;
   CaptureRecoveryScript script;
@@ -1031,7 +1173,7 @@ int main(int argc, char** argv) {
     conversion(); lifecycle(); shortTransfers(); recoveredUnderrun(); recoveryFailures();
     playbackTimestampMath(); outputStatusEstimates(); outputStatusUnavailableThenValid();
     outputStatusXrunRecovery(); outputStatusTerminal(); leases(); audioInputBus();
-    captureRecovery(); captureRecoveryFailures(); captureTimestampConfiguration();
+    wideCaptureBus(); captureRecovery(); captureRecoveryFailures(); captureTimestampConfiguration();
     captureTimestampMath(); captureTimestampDelay(); captureTimestampRecovery();
     captureTimestampApiFailure();
     std::puts("PASS ALSA conversion, lifecycle, output/capture recovery, timestamps and bounded capture lease tests");

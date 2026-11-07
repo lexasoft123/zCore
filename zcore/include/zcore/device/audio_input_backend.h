@@ -12,6 +12,8 @@ namespace singz {
 using AudioInputPush = bool (*)(void*, const float*, uint32_t, uint64_t,
                                 uint64_t, AudioInputTimestampQuality) noexcept;
 
+inline constexpr uint32_t kAudioInputBusMaxChannels = 64;
+
 struct AudioInputBusConfig {
   std::string deviceUid;
   std::vector<uint32_t> channels;
@@ -24,6 +26,13 @@ struct AudioInputBusBlock {
   uint32_t channelCount = 0, frames = 0, capacityFrames = 0;
   uint64_t firstNs = 0, deliveryNs = 0;
   AudioInputTimestampQuality quality = AudioInputTimestampQuality::Unknown;
+  // Optional provider provenance. Zero generation means unavailable. ALSA
+  // sourceFrame counts PCM frames actually received within the physical
+  // route; it is not a hardware sample position or a lost-frame estimate.
+  AudioInputCaptureMetadata capture{};
+  // Cumulative ALSA overrun errors observed by the shared physical owner.
+  // This is the last callback observation, not a terminal-status query.
+  uint64_t xruns = 0;
 };
 using AudioInputBusPush = bool (*)(void*, const AudioInputBusBlock&) noexcept;
 enum class AudioInputBusOpenStatus { Unsupported, Ready, Error };
