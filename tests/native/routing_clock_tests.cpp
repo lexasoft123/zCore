@@ -442,6 +442,11 @@ void cachedFirDispatch() {
                      1000000000000ULL, rate, true);
     }
     checkFirCase(10, 256, 44100, offset, 1, false, true, false);
+    // Exercise both odd FIR tail lengths (207 and 209 taps) after paired SIMD
+    // accumulation, including an odd channel that retains the portable dot.
+    checkFirCase(10, 256, 48500, 4096.625L, 2, false, true, false);
+    checkFirCase(15, 128, 48500, 4096.125L, 3, true, false, false);
+    checkFirCase(3, 256, 48000 * .9998, 4096.875L, 1, false, true, false);
     // Small blocks, direct unity samples, insufficient retained history, and
     // windows beyond the 512-frame cache retain the generic fallback.
     checkFirCase(10, 64, 48000 * 1.0002, offset, 1, false, false, true);

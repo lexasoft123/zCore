@@ -11,6 +11,8 @@
 #include <optional>
 #if defined(__SSE2__) || defined(_M_X64)
 #include <emmintrin.h>
+#elif defined(__aarch64__)
+#include <arm_neon.h>
 #endif
 
 namespace zcore::routing {
@@ -67,6 +69,28 @@ class CachedFir {
             sum[1] += weights[tap] * b[tap];
         }
         return sum;
+#elif defined(__aarch64__)
+        // AArch64 baseline Advanced SIMD: share each double-precision weight
+        // load across both channels, with the same four partial sums as SSE2.
+        auto a0 = vdupq_n_f64(0), a1 = vdupq_n_f64(0);
+        auto b0 = vdupq_n_f64(0), b1 = vdupq_n_f64(0);
+        uint32_t tap = 0;
+        for (; tap + 4 <= count; tap += 4) {
+            const auto w0 = vld1q_f64(weights + tap);
+            const auto w1 = vld1q_f64(weights + tap + 2);
+            const auto av = vld1q_f32(a + tap), bv = vld1q_f32(b + tap);
+            a0 = vaddq_f64(a0, vmulq_f64(w0, vcvt_f64_f32(vget_low_f32(av))));
+            a1 = vaddq_f64(a1, vmulq_f64(w1, vcvt_f64_f32(vget_high_f32(av))));
+            b0 = vaddq_f64(b0, vmulq_f64(w0, vcvt_f64_f32(vget_low_f32(bv))));
+            b1 = vaddq_f64(b1, vmulq_f64(w1, vcvt_f64_f32(vget_high_f32(bv))));
+        }
+        std::array<double, 2> sum{vaddvq_f64(a0) + vaddvq_f64(a1),
+                                  vaddvq_f64(b0) + vaddvq_f64(b1)};
+        for (; tap < count; ++tap) {
+            sum[0] += weights[tap] * a[tap];
+            sum[1] += weights[tap] * b[tap];
+        }
+        return sum;
 #else
         return {dot(a, weights, count), dot(b, weights, count)};
 #endif
@@ -75,7 +99,7 @@ class CachedFir {
   public:
     // One source lookup per frame across the whole block, then contiguous dot
     // products with double intermediates. Independent partial sums change only
-    // rounding order. No ISA beyond mandatory x64 SSE2, no shared mutable state.
+    // rounding order. Only baseline x64 SSE2/AArch64 SIMD; no shared mutable state.
     template <unsigned capacity, unsigned channelCapacity, bool fixedPhase, class Provider>
     static ZCORE_ROUTING_READER_NOINLINE std::optional<uint32_t>
     readWindow(ResamplePosition read, ResampleOutput output, uint32_t frames,
