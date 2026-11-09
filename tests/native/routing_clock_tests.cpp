@@ -1,6 +1,8 @@
 #include <zcore/routing/audio_history.h>
 #include <zcore/routing/audio_resampler.h>
 #include <zcore/routing/sample_clock.h>
+#include <zcore/routing/sinc_kernel.h>
+#include <bit>
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -407,6 +409,72 @@ FirCaseResult checkFirCase(size_t channels, uint32_t frames, double sourceRate,
     if (requireGenericReads) CHECK(optimized.reads == generic.reads);
     return {optimized.reads, generic.reads, maximumError, snr};
 }
+void sincLookupMatchesOriginalFormula() {
+    constexpr uint32_t density = 2048;
+    // Independently prepare the original float table, including its last
+    // (radius) entry: coefficient(radius, 1) is guarded, not a table accessor.
+    const auto bessel = [](double value) {
+        double sum = 1, term = 1;
+        for (unsigned order = 1; order < 64; ++order) {
+            term *= value * value / (4 * order * order);
+            sum += term;
+            if (term < 1e-12 * sum) break;
+        }
+        return sum;
+    };
+    std::vector<float> values(SincKernel::kRadius * density + 1);
+    const auto normalization = bessel(9);
+    for (size_t index = 0; index < values.size(); ++index) {
+        const double distance = static_cast<double>(index) / density;
+        const auto x = std::numbers::pi_v<double> * distance;
+        const auto sinc = index ? std::sin(x) / x : 1;
+        const auto relative = distance / SincKernel::kRadius;
+        const auto window = bessel(9 * std::sqrt(std::max(0.0, 1 - relative * relative)));
+        values[index] = static_cast<float>(sinc * window / normalization);
+    }
+    const auto& kernel = SincKernel::prepared();
+    const auto check = [&](double sourceDistance, double cutoff) {
+        const auto distance = std::abs(sourceDistance) * cutoff;
+        double original = 0;
+        if (std::isfinite(distance) && cutoff > 0 && cutoff <= 1 && distance < SincKernel::kRadius) {
+            const auto position = distance * density;
+            const auto index = static_cast<size_t>(position);
+            const auto fraction = position - index;
+            // Preserve the original float subtraction BEFORE double promotion.
+            original = values[index] + (values[index + 1] - values[index]) * fraction;
+        }
+        const auto actual = noHeap([&] { return kernel.coefficient(sourceDistance, cutoff); });
+        CHECK(std::bit_cast<uint64_t>(actual) == std::bit_cast<uint64_t>(original));
+    };
+    for (double cutoff : {1.0, .94, .9400000000001, .5, .01,
+                           std::numeric_limits<double>::min(),
+                           std::numeric_limits<double>::denorm_min()}) {
+        for (double distance : {0.0, -0.0, .125, -.375, 1.0, -55.123456789,
+                                 std::nextafter(96.0, 0.0), 96.0,
+                                 std::nextafter(96.0, INFINITY), 512.0,
+                                 std::numeric_limits<double>::max()})
+            check(distance, cutoff);
+        for (uint32_t index : {0u, 1u, 2047u, 2048u, 98303u, 196606u, 196607u}) {
+            const auto source = (static_cast<double>(index) / density) / cutoff;
+            check(source, cutoff);
+            check(std::nextafter(source, 0.0), cutoff);
+            check(std::nextafter(source, INFINITY), cutoff);
+        }
+    }
+    for (double cutoff : {0.0, -0.0, -1.0, std::nextafter(1.0, INFINITY),
+                           double(NAN), double(INFINITY), -double(INFINITY)})
+        for (double distance : {0.0, 1.25, double(NAN), double(INFINITY)})
+            check(distance, cutoff);
+    // Deterministic arbitrary phases across the complete support and both
+    // signs. Large phase walks would reject table-index or fraction rounding.
+    uint64_t random = 0x123456789abcdefULL;
+    for (unsigned index = 0; index < 8192; ++index) {
+        random = random * 6364136223846793005ULL + 1;
+        const double phase = double(random >> 11) * 0x1p-53;
+        const double cutoff = .1 + .9 * double((random >> 24) & 65535) / 65535;
+        check((index & 1 ? -1 : 1) * phase * 96 / cutoff, cutoff);
+    }
+}
 void cachedFirDispatch() {
     constexpr long double offset = 4096.375L;
     const auto mono = checkFirCase(1, 128, 48000 * 1.0002, offset, 1,
@@ -467,6 +535,7 @@ void cachedFirDispatch() {
 }
 }
 int main() {
+    sincLookupMatchesOriginalFormula();
     driftingCaptureAndOutput();
     verifiedTimestampPhaseSteps();
     sustainedUnsupportedRateIsNotCorrected();

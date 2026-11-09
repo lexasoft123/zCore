@@ -22,8 +22,12 @@ class SincKernel {
         if (!std::isfinite(distance) || cutoff <= 0 || cutoff > 1 || distance >= kRadius)
             return 0;
         const auto position = distance * kDensity;
-        const auto index = static_cast<size_t>(position);
-        const auto fraction = position - index;
+        // The guards bound position to [0, 96 * 2048). Retain the integral
+        // value in floating point for interpolation, avoiding a 64-bit integer
+        // round trip on AArch64 while keeping the table index exactly bounded.
+        const auto integral = std::floor(position);
+        const auto index = static_cast<uint32_t>(integral);
+        const auto fraction = position - integral;
         return values_[index] + (values_[index + 1] - values_[index]) * fraction;
     }
 
