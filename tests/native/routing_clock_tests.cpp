@@ -371,6 +371,30 @@ FirCaseResult checkFirCase(size_t channels, uint32_t frames, double sourceRate,
                                   std::span<uint8_t>(referenceAvailable).subspan(begin, length));
         });
     }
+    if (channels <= 2) {
+      // Keep the 32-frame provider count above as the dispatch oracle, but
+      // use 16-frame reads for ALL mono/stereo numerics: they cannot use cache.
+      FirProvider numeric = generic;
+      numeric.reads = 0;
+      referenceMissing = 0;
+      for (uint32_t begin = 0; begin < frames; begin += 16) {
+        const auto length = std::min(frames - begin, 16u);
+        auto tileChannels = referenceChannels;
+        for (size_t channel = 0; channel < channels; ++channel)
+          tileChannels[channel] += begin * stride;
+        ResampleOutput tileOutput{
+            std::span<float *const>(tileChannels.data(), channels),
+            frames - begin + 4, stride};
+        auto tilePosition = position;
+        tilePosition.offset =
+            position.offset + static_cast<long double>(begin) * step;
+        referenceMissing += noHeap([&] {
+          return resampler.read(
+              tilePosition, tileOutput, length, FirProvider::read, &numeric,
+              std::span<uint8_t>(referenceAvailable).subspan(begin, length));
+        });
+      }
+    }
     CHECK(fullMissing == referenceMissing);
     for (uint32_t frame = 0; frame < frames; ++frame)
         CHECK(fullAvailable[frame] == referenceAvailable[frame]);
@@ -405,7 +429,12 @@ FirCaseResult checkFirCase(size_t channels, uint32_t frames, double sourceRate,
         CHECK(snr > 120);
     }
     CHECK(optimized.reads && generic.reads);
-    if (requireReduction) CHECK(optimized.reads * 2 < generic.reads);
+    if (requireReduction) {
+      if (frames >= 128)
+        CHECK(optimized.reads * 2 < generic.reads);
+      else
+        CHECK(optimized.reads < generic.reads);
+    }
     if (requireGenericReads) CHECK(optimized.reads == generic.reads);
     return {optimized.reads, generic.reads, maximumError, snr};
 }
@@ -475,6 +504,58 @@ void sincLookupMatchesOriginalFormula() {
         check((index & 1 ? -1 : 1) * phase * 96 / cutoff, cutoff);
     }
 }
+void bulkSincMatchesScalar() {
+  const auto &kernel = SincKernel::prepared();
+  std::array<double, 512> expected{}, actual{};
+  double maximumWeightError = 0, maximumNormalizationError = 0;
+  const auto check = [&](uint32_t radius, double fraction, double cutoff,
+                         size_t count) {
+    double normalization = 0;
+    for (size_t tap = 0; tap < count; ++tap) {
+      expected[tap] =
+          kernel.coefficient((double(tap) - radius) - fraction, cutoff);
+      normalization += expected[tap];
+    }
+    actual.fill(12345);
+    const auto sum = noHeap([&] {
+      return kernel.fillCoefficients(radius, fraction, cutoff,
+                                     std::span<double>(actual.data(), count));
+    });
+    CHECK(std::isfinite(sum));
+    maximumNormalizationError =
+        std::max(maximumNormalizationError, std::abs(sum - normalization));
+    CHECK(std::abs(sum - normalization) <= 1e-12);
+    for (size_t tap = 0; tap < count; ++tap) {
+      CHECK(std::isfinite(actual[tap]));
+      maximumWeightError =
+          std::max(maximumWeightError, std::abs(actual[tap] - expected[tap]));
+      CHECK(std::abs(actual[tap] - expected[tap]) <= 1e-15);
+    }
+    for (size_t tap = count; tap < actual.size(); ++tap)
+      CHECK(actual[tap] == 12345);
+  };
+  for (double cutoff :
+       {.94, .940000000001, 1.0, .5, .01,
+        std::numeric_limits<double>::denorm_min(), 0.0, -1.0,
+        std::nextafter(1.0, INFINITY), double(NAN), double(INFINITY)})
+    for (double fraction :
+         {0.0, -0.0, .125, .625, -.375, .999999999, std::nextafter(0.0, 1.0),
+          96.0, std::numeric_limits<double>::max(), double(NAN),
+          double(INFINITY), -double(INFINITY)})
+      for (size_t count : {0u, 1u, 2u, 3u, 4u, 127u, 207u, 209u, 512u})
+        check(103, fraction, cutoff, count);
+  for (unsigned frame = 0; frame < 10000; ++frame) {
+    const auto phase = std::fmod(.625 + double(frame) * .0002, 1.0);
+    check(103, phase, .94, 207);
+    check(104, -phase, .94 * .9998, 209);
+  }
+  // The bulk-vs-scalar phase walk must reject truncating an interpolation
+  // fraction: this concrete table cell differs well beyond the tolerance.
+  CHECK(std::abs(kernel.coefficient(.375 / 2048, 1) -
+                 kernel.coefficient(0, 1)) > 1e-15);
+  std::printf("Bulk sinc: maxWeightError %.3g, maxNormalizationError %.3g\n",
+              maximumWeightError, maximumNormalizationError);
+}
 void cachedFirDispatch() {
     constexpr long double offset = 4096.375L;
     const auto mono = checkFirCase(1, 128, 48000 * 1.0002, offset, 1,
@@ -486,13 +567,25 @@ void cachedFirDispatch() {
     checkFirCase(1, 128, 48000 * .999947, offset, 2, true, false, false);
     checkFirCase(2, 256, 96000, offset, 1, false, false, false);
     checkFirCase(2, 256, 96000 * 1.01, offset, 1, false, false, true);
-    checkFirCase(2, 64, 48000 * 1.0002, offset, 1, false, false, true);
+    checkFirCase(2, 64, 48000 * 1.0002, offset, 1, false, true, false);
     checkFirCase(2, 128, 48000, 4096.0001L, 1, false, false, true);
     checkFirCase(1, 128, 48000, 4096.9999L, 1, false, false, true);
     checkFirCase(1, 128, 48000 * 1.0002, -25.37L, 1, false, false, true, 128);
     checkFirCase(2, 256, 48000 * 1.0002, .375L, 2, false, false, true,
                  UINT64_MAX - 256);
     checkFirCase(2, 256, 192000, 4096.375L, 1, false, true, false);
+    // Short mono/stereo clock segments retain the identical full-quality
+    // filter. The 48/64+ provider-count assertion rejects restoring min128.
+    for (size_t channels : {size_t{1}, size_t{2}})
+      for (uint32_t frames : {32u, 48u, 64u, 96u, 127u})
+        for (double rate : {44100.0, 48000.0}) {
+          checkFirCase(channels, frames, rate * 1.0002, offset, 1, false,
+                       frames > 32, false, 1000000000000ULL, rate);
+          checkFirCase(channels, frames, rate * .9998, 4096.125L, 3, true,
+                       false, false, UINT64_MAX - 8192, rate);
+          checkFirCase(channels, frames, rate * .9998, 4096.875L, 2, false,
+                       frames > 32, false, 1000000000000ULL, rate, true);
+        }
     // FLOW8's ten channels previously missed both the stereo and >=16-channel
     // cache dispatch. Compare the actual reader with short generic tiles; a
     // dispatch bypass must fail the provider-fetch reduction assertion.
@@ -518,6 +611,8 @@ void cachedFirDispatch() {
     // Small blocks, direct unity samples, insufficient retained history, and
     // windows beyond the 512-frame cache retain the generic fallback.
     checkFirCase(10, 64, 48000 * 1.0002, offset, 1, false, false, true);
+    checkFirCase(2, 64, 96000, offset, 1, false, false,
+                 true); // fixed-phase min128 unchanged
     checkFirCase(10, 128, 48000, 4096.0001L, 2, false, false, true);
     checkFirCase(10, 128, 48000 * 1.0002, -25.37L, 1, false, false, true, 128);
     checkFirCase(10, 256, 96000 * 1.01, offset, 1, false, false, true);
@@ -536,6 +631,7 @@ void cachedFirDispatch() {
 }
 int main() {
     sincLookupMatchesOriginalFormula();
+    bulkSincMatchesScalar();
     driftingCaptureAndOutput();
     verifiedTimestampPhaseSteps();
     sustainedUnsupportedRateIsNotCorrected();
