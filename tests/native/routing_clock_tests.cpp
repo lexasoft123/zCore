@@ -285,7 +285,7 @@ void silenceChannelsAndRestart() {
 struct FirProvider {
     uint64_t origin;
     uint64_t reads = 0;
-    bool injectGaps = false;
+    bool injectGaps = false, silence = false;
     uint64_t invalidAt = UINT64_MAX, shortAt = UINT64_MAX, nonfiniteAt = UINT64_MAX;
     static ResampleFrame read(const void* context, uint64_t position,
                               std::span<float> values) noexcept {
@@ -297,7 +297,8 @@ struct FirProvider {
             : -static_cast<long double>(self.origin - position);
         const long double time = index / 48000;
         for (size_t channel = 0; channel < values.size(); ++channel) {
-            values[channel] = static_cast<float>(tone(time, static_cast<uint32_t>(channel)) +
+            values[channel] = self.silence ? 0.0f :
+                static_cast<float>(tone(time, static_cast<uint32_t>(channel)) +
                 .03L * std::cos(2 * std::numbers::pi_v<long double> * 31 * time + channel));
         }
         if (self.injectGaps && position == self.nonfiniteAt) {
@@ -315,10 +316,12 @@ struct FirCaseResult {
 FirCaseResult checkFirCase(size_t channels, uint32_t frames, double sourceRate,
                            long double offset, uint32_t stride, bool gaps,
                            bool requireReduction, bool requireGenericReads,
-                           uint64_t anchor = 1000000000000ULL) {
-    CHECK(channels >= 1 && channels <= 2 && frames >= 32 && frames <= 256);
+                           uint64_t anchor = 1000000000000ULL,
+                           double outputRate = 48000, bool silence = false) {
+    CHECK(channels >= 1 && channels <= 16 && frames >= 32 && frames <= 256);
     CHECK(stride >= 1 && stride <= 3);
     FirProvider optimized{anchor}, generic{anchor};
+    optimized.silence = generic.silence = silence;
     if (gaps) {
         optimized.injectGaps = generic.injectGaps = true;
         optimized.invalidAt = generic.invalidAt = anchor + 4096 + 31;
@@ -326,13 +329,16 @@ FirCaseResult checkFirCase(size_t channels, uint32_t frames, double sourceRate,
         optimized.nonfiniteAt = generic.nonfiniteAt = anchor + 4096 + 137;
     }
     constexpr size_t planeFrames = 260 * 3;
-    std::array<std::array<float, planeFrames>, 2> fullPlanes{}, referencePlanes{};
+    std::array<std::array<float, planeFrames>, 16> fullPlanes{}, referencePlanes{};
     for (size_t channel = 0; channel < channels; ++channel) {
         fullPlanes[channel].fill(99);
         referencePlanes[channel].fill(99);
     }
-    std::array<float*, 2> fullChannels{fullPlanes[0].data(), fullPlanes[1].data()};
-    std::array<float*, 2> referenceChannels{referencePlanes[0].data(), referencePlanes[1].data()};
+    std::array<float*, 16> fullChannels{}, referenceChannels{};
+    for (size_t channel = 0; channel < channels; ++channel) {
+        fullChannels[channel] = fullPlanes[channel].data();
+        referenceChannels[channel] = referencePlanes[channel].data();
+    }
     const uint32_t capacity = frames + 4;
     ResampleOutput fullOutput{std::span<float* const>(fullChannels.data(), channels),
                               capacity, stride};
@@ -341,14 +347,14 @@ FirCaseResult checkFirCase(size_t channels, uint32_t frames, double sourceRate,
     position.anchor = anchor;
     position.offset = offset;
     position.sourceRate = sourceRate;
-    position.outputRate = 48000;
+    position.outputRate = outputRate;
     AudioResampler resampler;
     const auto fullMissing = noHeap([&] {
         return resampler.read(position, fullOutput, frames, FirProvider::read, &optimized,
                               std::span<uint8_t>(fullAvailable.data(), frames));
     });
     uint32_t referenceMissing = 0;
-    const auto step = sourceRate / 48000;
+    const auto step = sourceRate / outputRate;
     for (uint32_t begin = 0; begin < frames; begin += 32) {
         const auto length = std::min(frames - begin, 32u);
         auto tileChannels = referenceChannels;
@@ -372,6 +378,7 @@ FirCaseResult checkFirCase(size_t channels, uint32_t frames, double sourceRate,
             const auto actual = fullPlanes[channel][frame * stride];
             const auto expected = referencePlanes[channel][frame * stride];
             CHECK(std::isfinite(actual) && std::isfinite(expected));
+            if (silence) CHECK(actual == 0 && expected == 0);
             const auto difference = static_cast<double>(actual) - expected;
             maximumError = std::max(maximumError, std::abs(difference));
             error += difference * difference;
@@ -418,6 +425,33 @@ void cachedFirDispatch() {
     checkFirCase(2, 256, 48000 * 1.0002, .375L, 2, false, false, true,
                  UINT64_MAX - 256);
     checkFirCase(2, 256, 192000, 4096.375L, 1, false, true, false);
+    // FLOW8's ten channels previously missed both the stereo and >=16-channel
+    // cache dispatch. Compare the actual reader with short generic tiles; a
+    // dispatch bypass must fail the provider-fetch reduction assertion.
+    const auto microphones = checkFirCase(10, 256, 48000 * 1.0002, offset, 1,
+                                          false, true, false);
+    checkFirCase(10, 256, 48000 * .9998, offset, 3, false, true, false);
+    checkFirCase(3, 128, 48000 * 1.000037, offset, 2, false, true, false);
+    checkFirCase(15, 256, 48000 * .999947, offset, 1, false, true, false);
+    for (double rate : {44100.0, 48000.0}) {
+        checkFirCase(10, 256, rate * 1.0002, offset, 2, false, true, false,
+                     1000000000000ULL, rate);
+        checkFirCase(10, 256, rate * .9998, offset, 1, true, false, false,
+                     UINT64_MAX - 8192, rate);
+        checkFirCase(10, 128, rate * .9998, offset, 3, false, true, false,
+                     1000000000000ULL, rate, true);
+    }
+    checkFirCase(10, 256, 44100, offset, 1, false, true, false);
+    // Small blocks, direct unity samples, insufficient retained history, and
+    // windows beyond the 512-frame cache retain the generic fallback.
+    checkFirCase(10, 64, 48000 * 1.0002, offset, 1, false, false, true);
+    checkFirCase(10, 128, 48000, 4096.0001L, 2, false, false, true);
+    checkFirCase(10, 128, 48000 * 1.0002, -25.37L, 1, false, false, true, 128);
+    checkFirCase(10, 256, 96000 * 1.01, offset, 1, false, false, true);
+    std::printf("Cached ten-channel FIR: provider reads %llu -> %llu, maxError %.3g, SNR %.2f dB\n",
+        static_cast<unsigned long long>(microphones.genericReads),
+        static_cast<unsigned long long>(microphones.optimizedReads),
+        microphones.maximumError, microphones.snr);
     std::printf("Cached mono/stereo FIR: provider reads %llu -> %llu and %llu -> %llu\n",
         static_cast<unsigned long long>(mono.genericReads),
         static_cast<unsigned long long>(mono.optimizedReads),

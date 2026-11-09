@@ -245,6 +245,12 @@ class CachedFir {
         if (output.channels.size() >= 16)
             return readWindow<512, kMaximumRoutingChannels, false>(
                 position, output, frames, kernel, cutoff, provider, availableFrames);
+        // Multichannel microphone interfaces also need the cached fractional
+        // reader when their measured clock drifts near the output rate. Keep
+        // stereo dispatch and exact integer decimation on their existing paths.
+        if (output.channels.size() >= 3)
+            return readWindow<512, 16, false>(
+                position, output, frames, kernel, cutoff, provider, availableFrames);
         return std::nullopt;
     }
 };
