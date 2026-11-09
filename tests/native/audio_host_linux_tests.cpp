@@ -61,6 +61,94 @@ AudioHostConfig config(const std::string& output = "test-output") {
   result.maximumFrames = 1024;
   return result;
 }
+void usbIdentity() {
+  detail::AlsaIdentityProperties usb;
+  usb.cardId = "FLOW8";
+  usb.usb = true;
+  usb.usbVendor = "1397";
+  usb.usbProduct = "050C";
+  usb.usbModel = "FLOW 8";
+  usb.path = "platform-usb5-5-1";
+  usb.usbPath = "/sys/devices/platform/usb5/5-1";
+  const auto model = detail::alsaStableIdentity(usb);
+  auto replugged = usb;
+  replugged.cardId = "FLOW8_1";
+  replugged.path = "platform-usb3-3-1";
+  replugged.usbPath = "/sys/devices/platform/usb3/3-1";
+  CHECK(detail::alsaStableIdentity(replugged) == model);
+  CHECK(model.starts_with("usb-model:1397:050c:"));
+  // Containers may have no udev property database. Actual FLOW 8 USB sysattrs
+  // include a real serial, which must take priority over the model fallback.
+  usb.path = {};
+  usb.usbSerial = "A0-E6-F8-5B-DC-77";
+  const auto unit = detail::alsaStableIdentity(usb);
+  CHECK(unit.starts_with("usb-serial:1397:050c:"));
+  CHECK(unit != model);
+  replugged.usbSerial = usb.usbSerial;
+  CHECK(detail::alsaStableIdentity(replugged) == unit);
+  replugged.usbSerial = "another-unit";
+  CHECK(detail::alsaStableIdentity(replugged) != unit);
+  usb.serial = "Behringer_FLOW_8_A0-E6-F8-5B-DC-77";
+  usb.shortSerial = "A0-E6-F8-5B-DC-77";
+  CHECK(detail::alsaStableIdentity(usb) == "serial:" + std::string(usb.serial));
+  usb.serial = {};
+  usb.shortSerial = {};
+  usb.usbSerial = {};
+  auto otherModel = usb;
+  otherModel.usbModel = "FLOW:8";
+  CHECK(detail::alsaStableIdentity(otherModel) != model);
+  otherModel.usbVendor = "FFFF";
+  CHECK(detail::alsaStableIdentity(otherModel) != model);
+  otherModel.usbVendor = "1397";
+  otherModel.usbProduct = "050d";
+  CHECK(detail::alsaStableIdentity(otherModel) != model);
+  auto fallback = usb;
+  fallback.usbVendor = "139:";
+  CHECK(detail::alsaStableIdentity(fallback) == "sysfs:" + std::string(usb.usbPath));
+  fallback.path = "pci-audio";
+  CHECK(detail::alsaStableIdentity(fallback) == "path:pci-audio");
+  fallback.usb = false;
+  fallback.usbVendor = "1397";
+  CHECK(detail::alsaStableIdentity(fallback) == "path:pci-audio");
+  fallback.path = {};
+  CHECK(detail::alsaStableIdentity(fallback) == "id:FLOW8");
+
+  const auto endpoint = [](const std::string& identity, int card, int pcm) {
+    detail::AlsaEndpoint result;
+    result.info.uid = "alsa:" + identity + ":pcm:" + std::to_string(pcm);
+    result.info.inputChannels = 2;
+    result.info.outputChannels = 4;
+    result.pcm = "hw:" + std::to_string(card) + "," + std::to_string(pcm) + ",0";
+    return result;
+  };
+  const auto first = endpoint(model, 1, 0);
+  const auto moved = endpoint(model, 7, 0);
+  CHECK(first.info.uid == moved.info.uid && first.pcm != moved.pcm);
+  std::vector<detail::AlsaEndpoint> rows{first, endpoint(model, 1, 1)};
+  detail::alsaRemoveAmbiguousEndpoints(rows);
+  CHECK(rows.size() == 2); // Two PCMs of one unit remain addressable.
+  rows = {first, endpoint(model, 7, 1)};
+  detail::alsaRemoveAmbiguousEndpoints(rows);
+  CHECK(rows.empty()); // Twin units with different PCM layouts are unsafe too.
+  rows = {first, moved};
+  detail::alsaRemoveAmbiguousEndpoints(rows);
+  CHECK(rows.empty());
+  rows = {moved}; // After unplug/replug, capture and output recover the same UID.
+  detail::alsaRemoveAmbiguousEndpoints(rows);
+  detail::alsaUniqueDefaults(rows);
+  CHECK(rows.size() == 1 && rows[0].info.uid == first.info.uid);
+  CHECK(rows[0].info.defaultInput && rows[0].info.defaultOutput);
+  rows = {endpoint(unit, 1, 0), endpoint(detail::alsaStableIdentity(replugged), 7, 0)};
+  detail::alsaRemoveAmbiguousEndpoints(rows);
+  CHECK(rows.size() == 2); // Proven serials distinguish identical models.
+  rows = {endpoint(unit, 1, 0), endpoint(unit, 7, 1)};
+  detail::alsaRemoveAmbiguousEndpoints(rows);
+  CHECK(rows.empty()); // Repeated descriptor serials are not assumed unique.
+  rows = {endpoint("path:pci-audio", 1, 0), endpoint("path:pci-audio", 2, 0)};
+  detail::alsaRemoveAmbiguousEndpoints(rows);
+  CHECK(rows.empty()); // Existing duplicate-UID protection remains in force.
+}
+
 void conversion() {
   for (auto format : {SND_PCM_FORMAT_FLOAT_LE, SND_PCM_FORMAT_S32_LE,
        SND_PCM_FORMAT_S24_3LE, SND_PCM_FORMAT_S24_LE, SND_PCM_FORMAT_S16_LE}) {
@@ -1170,7 +1258,7 @@ int main(int argc, char** argv) {
   if (argc == 3 && std::string(argv[1]) == "--loopback") loopback(argv[2]);
   else {
     CHECK(argc == 1);
-    conversion(); lifecycle(); shortTransfers(); recoveredUnderrun(); recoveryFailures();
+    usbIdentity(); conversion(); lifecycle(); shortTransfers(); recoveredUnderrun(); recoveryFailures();
     playbackTimestampMath(); outputStatusEstimates(); outputStatusUnavailableThenValid();
     outputStatusXrunRecovery(); outputStatusTerminal(); leases(); audioInputBus();
     wideCaptureBus(); captureRecovery(); captureRecoveryFailures(); captureTimestampConfiguration();

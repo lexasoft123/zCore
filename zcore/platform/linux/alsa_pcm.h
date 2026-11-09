@@ -6,6 +6,7 @@
 #include <atomic>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <zcore/device/audio_host.h>
@@ -17,6 +18,15 @@ struct AlsaEndpoint {
   std::string pcm;
 };
 
+// Control-domain metadata only: USB sysattrs also work when udev's property
+// database is unavailable inside a container. Views are consumed immediately.
+struct AlsaIdentityProperties {
+  std::string_view cardId, serial, shortSerial, path, usbPath;
+  std::string_view usbVendor, usbProduct, usbModel, usbSerial;
+  bool usb{false};
+};
+std::string alsaStableIdentity(const AlsaIdentityProperties& properties);
+void alsaRemoveAmbiguousEndpoints(std::vector<AlsaEndpoint>& endpoints);
 std::vector<AlsaEndpoint> alsaEndpoints();
 void alsaUniqueDefaults(std::vector<AlsaEndpoint>& endpoints) noexcept;
 uint64_t alsaMonotonicNs() noexcept;
