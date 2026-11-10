@@ -337,6 +337,17 @@ if(ZCORE_BUILD_TESTS)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
   add_test(NAME zcore_importer_tests
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test-import-zcore.py")
+  if(ZCORE_BUILD_MEDIA)
+    add_executable(zcore_utf8_path_tests tests/native/utf8_path_tests.cpp)
+    target_compile_features(zcore_utf8_path_tests PRIVATE cxx_std_20)
+    target_link_libraries(zcore_utf8_path_tests PRIVATE SingZ::zcore_media)
+    if(MSVC)
+      # The test's u8"" paths are UTF-8 source; MSVC reads source in the ANSI
+      # code page unless told otherwise.
+      target_compile_options(zcore_utf8_path_tests PRIVATE /utf-8)
+    endif()
+    add_test(NAME zcore_utf8_path_tests COMMAND zcore_utf8_path_tests)
+  endif()
   if(ZCORE_BUILD_ANALYSIS)
     add_executable(zdsp_analysis_tests zdsp/tests/zdsp_analysis_tests.cpp)
     target_compile_features(zdsp_analysis_tests PRIVATE cxx_std_20)
