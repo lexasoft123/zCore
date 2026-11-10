@@ -114,6 +114,10 @@ struct AudioHostDeviceInfo {
   AudioHostTransport transport{AudioHostTransport::Unknown};
   AudioHostMonitoringSuitability monitoringSuitability{
       AudioHostMonitoringSuitability::Unknown};
+  // A transient exclusive-owner conflict prevented capability discovery.
+  // This is distinct from an unsupported direction or a missing endpoint.
+  bool inputProbeBusy{false};
+  bool outputProbeBusy{false};
 };
 
 struct AudioHostInventory {
