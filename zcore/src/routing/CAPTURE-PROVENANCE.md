@@ -24,3 +24,22 @@ Behavior is retained: timestamp-addressed multichannel history, measured clock m
 | `native/core/finite_samples.hpp` | `e369d09470fb2acf08e9f4bac0be5e69f1d981776ecdad92a7dce9ae1c00b1c6` |
 | `native/include/loopz/audio_scene.hpp` | `988130274aff2be6ff44b21d14a9486964abaaef4ae81e425e82ea17d673eca6` |
 | `native/include/loopz/timeline.hpp` | `ddd00d0c24169b4b4189f55267662359e72d8da74dfec875bcc814d9354c2bfd` |
+
+The hashes above identify the LoopZ sources at port time. They are a record,
+not a check: nothing verifies them, and these zCore copies have since diverged
+on purpose. Changes after the port, by zCore commit:
+
+| Commit | Change |
+| --- | --- |
+| `24220ae` | `audio_history`, `sample_clock`: bound continuous-counter clock correction across timestamp jitter. |
+| `d2b3219` | `audio_resampler.cpp`: reuse the bounded FIR cache for drifting mono and stereo reads. |
+| `1fbd1eb` | `cached_fir.hpp`: cached FIR for reads of 3 or more channels (up to its 16-channel window). |
+| `08e1c69` | `cached_fir.hpp`: AArch64 Advanced SIMD `dotPair` sharing weight loads across channels. |
+| `b941c55` | `sinc_kernel.h`: table lookup without wide-integer round trips (bit-identical results). |
+| `d7fd3a4` | `sinc_kernel.h`, `cached_fir.hpp`: batched `fillCoefficients` (AArch64 SIMD) and a 32-frame minimum for drifting mono/stereo reads. |
+
+Commits that touch only `zcore/include/zcore/device/audio_input_backend.h`
+(not a ported routing file) are not listed. Numerical checks live in
+`tests/native/routing_clock_tests.cpp`: a bit-exact sinc lookup, batched
+weights against the scalar formula, and cached FIR reads against the uncached
+reference by SNR. They are not inferred from these hashes.

@@ -105,22 +105,19 @@ class CachedFir {
     readWindow(ResamplePosition read, ResampleOutput output, uint32_t frames,
                const SincKernel& kernel, double cutoff, Provider& provider,
                std::span<uint8_t> availableFrames) noexcept {
-      // Timestamped history can split a mono/stereo block at clock-segment
-      // boundaries. The same bounded FIR also covers these short fragments.
-      constexpr uint32_t minimumFrames =
-          !fixedPhase && channelCapacity == 2 ? 32 : 128;
-      if (frames < minimumFrames || frames > 256 ||
-          output.channels.size() > channelCapacity)
-        return std::nullopt;
-      const auto radius =
-          static_cast<uint32_t>(std::ceil(SincKernel::kRadius / cutoff));
-      const auto taps = 2 * radius + 1;
-      if (taps > capacity)
-        return std::nullopt;
-      struct Target {
-        uint64_t center{};
-        double fraction{};
-      };
+        // Timestamped history can split a mono/stereo block at clock-segment
+        // boundaries. The same bounded FIR also covers these short fragments.
+        constexpr uint32_t minimumFrames = !fixedPhase && channelCapacity == 2 ? 32 : 128;
+        if (frames < minimumFrames || frames > 256 || output.channels.size() > channelCapacity)
+            return std::nullopt;
+        const auto radius = static_cast<uint32_t>(std::ceil(SincKernel::kRadius / cutoff));
+        const auto taps = 2 * radius + 1;
+        if (taps > capacity)
+            return std::nullopt;
+        struct Target {
+            uint64_t center{};
+            double fraction{};
+        };
         std::array<Target, 256> targets{};
         uint64_t first = UINT64_MAX, last = 0;
         const auto step = read.sourceRate / read.outputRate;
