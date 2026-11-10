@@ -87,8 +87,11 @@ std::mutex inventoryMutex;
 std::map<std::string, AudioHostDeviceInfo> capabilities;
 void probe(const std::string& pcm, bool input, AudioHostDeviceInfo& info) {
   snd_pcm_t* handle = nullptr;
-  if (snd_pcm_open(&handle, pcm.c_str(), input ? SND_PCM_STREAM_CAPTURE :
-      SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK) < 0) return;
+  auto& busy = input ? info.inputProbeBusy : info.outputProbeBusy;
+  const int opened = snd_pcm_open(&handle, pcm.c_str(), input ? SND_PCM_STREAM_CAPTURE :
+      SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK);
+  busy = opened == -EBUSY;
+  if (opened < 0) return;
   snd_pcm_hw_params_t* params = nullptr;
   snd_pcm_hw_params_alloca(&params);
   if (snd_pcm_hw_params_any(handle, params) >= 0) {
@@ -238,6 +241,7 @@ std::vector<AlsaEndpoint> alsaEndpoints() {
       row.pcm = "hw:" + std::to_string(card) + "," + std::to_string(pcmDevice) + ",0";
       const auto cached = capabilities.find(row.info.uid);
       if (cached != capabilities.end()) row.info = cached->second;
+      row.info.inputProbeBusy = row.info.outputProbeBusy = false;
       row.info.label = std::string(snd_ctl_card_info_get_name(cardInfo)) +
           " / PCM " + std::to_string(pcmDevice);
       row.info.transport = transport;
