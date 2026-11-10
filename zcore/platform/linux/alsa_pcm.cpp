@@ -12,6 +12,8 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <set>
+#include <limits>
 
 namespace singz::detail {
 static_assert(std::endian::native == std::endian::little,
@@ -25,6 +27,49 @@ uint64_t alsaClockId(const std::string& uid) noexcept {
   uint64_t hash = 14695981039346656037ull;
   for (unsigned char c : uid) hash = (hash ^ c) * 1099511628211ull;
   return hash ? hash : 1;
+}
+uint64_t alsaTimespecMonotonicNs(const snd_htimestamp_t& time) noexcept {
+  constexpr uint64_t billion = 1000000000ull;
+  if (time.tv_sec < 0 || time.tv_nsec < 0 || time.tv_nsec >= 1000000000L) return 0;
+  const auto seconds = static_cast<uint64_t>(time.tv_sec);
+  const auto nanoseconds = static_cast<uint64_t>(time.tv_nsec);
+  const auto maximum = std::numeric_limits<uint64_t>::max();
+  if (seconds > (maximum - nanoseconds) / billion) return 0;
+  return seconds * billion + nanoseconds;
+}
+uint64_t alsaCaptureFirstSampleNs(const AlsaCaptureSnapshot& snapshot,
+    uint32_t rate, uint32_t bufferFrames, uint64_t previousTimestampNs,
+    uint64_t previousFirstSampleNs) noexcept {
+  const uint64_t timestampNs = alsaTimespecMonotonicNs(snapshot.time);
+  if (!timestampNs || timestampNs < previousTimestampNs || !rate || !bufferFrames ||
+      !snapshot.available || snapshot.available > bufferFrames) return 0;
+  const long double queued = static_cast<long double>(snapshot.available) * 1e9L / rate;
+  if (!std::isfinite(queued) || queued < 0 || queued > timestampNs) return 0;
+  const auto queuedNs = static_cast<uint64_t>(queued);
+  if (queuedNs > timestampNs) return 0;
+  const uint64_t firstSampleNs = timestampNs - queuedNs;
+  if (!firstSampleNs ||
+      (previousFirstSampleNs && firstSampleNs <= previousFirstSampleNs)) return 0;
+  return firstSampleNs;
+}
+uint64_t alsaPlaybackOutputHostNs(const AlsaPlaybackSnapshot& snapshot,
+    uint32_t rate, uint32_t bufferFrames, uint64_t previousTimestampNs,
+    uint64_t previousOutputHostNs) noexcept {
+  const uint64_t timestampNs = alsaTimespecMonotonicNs(snapshot.time);
+  if (!timestampNs || timestampNs < previousTimestampNs || !rate || !bufferFrames ||
+      snapshot.delay < 0) return 0;
+  // Budget policy, not an ALSA validity rule. Larger driver latency remains
+  // unavailable rather than falling back to callback time or a guessed bound.
+  if (static_cast<uint64_t>(snapshot.delay) > bufferFrames) return 0;
+  const long double delay = static_cast<long double>(snapshot.delay) * 1e9L / rate;
+  const auto maximum = std::numeric_limits<uint64_t>::max();
+  if (!std::isfinite(delay) || delay < 0 || delay > maximum) return 0;
+  const auto delayNs = static_cast<uint64_t>(delay);
+  if (timestampNs > maximum - delayNs) return 0;
+  const uint64_t outputHostNs = timestampNs + delayNs;
+  if (!outputHostNs || (previousOutputHostNs && outputHostNs <= previousOutputHostNs))
+    return 0;
+  return outputHostNs;
 }
 namespace {
 bool pcmError(int result, std::string& error) {
@@ -77,6 +122,69 @@ void probe(const std::string& pcm, bool input, AudioHostDeviceInfo& info) {
 }
 }
 
+std::string alsaStableIdentity(const AlsaIdentityProperties& properties) {
+  // Keep previously saved identities for devices with proven udev serials.
+  if (!properties.serial.empty() && !properties.shortSerial.empty())
+    return "serial:" + std::string(properties.serial);
+  const auto usbId = [](std::string_view value) {
+    std::string normalized;
+    if (value.size() != 4) return normalized;
+    for (const char c : value) {
+      if (c >= '0' && c <= '9') normalized += c;
+      else if (c >= 'a' && c <= 'f') normalized += c;
+      else if (c >= 'A' && c <= 'F') normalized += char(c - 'A' + 'a');
+      else return std::string{};
+    }
+    return normalized;
+  };
+  const std::string vendor = usbId(properties.usbVendor);
+  const std::string product = usbId(properties.usbProduct);
+  if (properties.usb && !vendor.empty() && !product.empty()) {
+    const auto hex = [](std::string_view value) {
+      constexpr char digits[] = "0123456789abcdef";
+      std::string encoded;
+      for (const unsigned char c : value) {
+        encoded += digits[c >> 4];
+        encoded += digits[c & 15];
+      }
+      return encoded;
+    };
+    // A real USB descriptor serial identifies a unit even without udev's DB.
+    // Otherwise identify the model; enumeration refuses simultaneous twins.
+    const bool serial = !properties.usbSerial.empty();
+    return std::string(serial ? "usb-serial:" : "usb-model:") + vendor + ":" +
+        product + ":" + hex(serial ? properties.usbSerial : properties.usbModel);
+  }
+  if (!properties.path.empty()) return "path:" + std::string(properties.path);
+  if (properties.usb && !properties.usbPath.empty())
+    return "sysfs:" + std::string(properties.usbPath);
+  return "id:" + std::string(properties.cardId);
+}
+
+void alsaRemoveAmbiguousEndpoints(std::vector<AlsaEndpoint>& endpoints) {
+  std::map<std::string, uint32_t> counts;
+  std::map<std::string, std::set<std::string>> usbCards;
+  const auto usbIdentity = [](const AlsaEndpoint& endpoint) {
+    const auto& uid = endpoint.info.uid;
+    if (!uid.starts_with("alsa:usb-model:") && !uid.starts_with("alsa:usb-serial:"))
+      return std::string{};
+    return uid.substr(0, uid.rfind(":pcm:"));
+  };
+  for (const auto& row : endpoints) {
+    ++counts[row.info.uid];
+    const auto identity = usbIdentity(row);
+    if (!identity.empty())
+      usbCards[identity].insert(row.pcm.substr(0, row.pcm.find(',')));
+  }
+  // Refuse the whole duplicate USB identity, even when its cards happen to
+  // expose different PCM numbers. Never select a twin by its enumeration order.
+  std::erase_if(endpoints, [&](const auto& row) {
+    const auto identity = usbIdentity(row);
+    return counts[row.info.uid] != 1 ||
+        (!identity.empty() && usbCards[identity].size() != 1);
+  });
+}
+
 std::vector<AlsaEndpoint> alsaEndpoints() {
   std::lock_guard<std::mutex> lock(inventoryMutex);
   std::vector<AlsaEndpoint> result;
@@ -92,24 +200,34 @@ std::vector<AlsaEndpoint> alsaEndpoints() {
       snd_ctl_close(control);
       continue;
     }
-    std::string identity = "id:" + std::string(snd_ctl_card_info_get_id(cardInfo));
+    AlsaIdentityProperties properties;
+    properties.cardId = snd_ctl_card_info_get_id(cardInfo);
     AudioHostTransport transport = AudioHostTransport::Unknown;
     udev_device* device = context ? udev_device_new_from_subsystem_sysname(
         context, "sound", ("card" + std::to_string(card)).c_str()) : nullptr;
+    const auto value = [](const char* text) -> std::string_view {
+      return text ? std::string_view(text) : std::string_view{};
+    };
+    std::string identity;
     if (device) {
-      const char* serial = udev_device_get_property_value(device, "ID_SERIAL");
-      const char* shortSerial = udev_device_get_property_value(device, "ID_SERIAL_SHORT");
-      const char* path = udev_device_get_property_value(device, "ID_PATH");
+      properties.serial = value(udev_device_get_property_value(device, "ID_SERIAL"));
+      properties.shortSerial = value(udev_device_get_property_value(device, "ID_SERIAL_SHORT"));
+      properties.path = value(udev_device_get_property_value(device, "ID_PATH"));
       auto* usb = udev_device_get_parent_with_subsystem_devtype(device, "usb", "usb_device");
-      if (serial && *serial && shortSerial && *shortSerial)
-        identity = "serial:" + std::string(serial);
-      else if (path && *path) identity = "path:" + std::string(path);
-      else if (usb) identity = "sysfs:" + std::string(udev_device_get_syspath(usb));
-      // USB interfaces without a serial must be pinned to their physical port.
-      if (usb) transport = AudioHostTransport::Usb;
-      else if (udev_device_get_parent_with_subsystem_devtype(device, "pci", nullptr))
+      if (usb) {
+        properties.usb = true;
+        properties.usbPath = value(udev_device_get_syspath(usb));
+        properties.usbVendor = value(udev_device_get_sysattr_value(usb, "idVendor"));
+        properties.usbProduct = value(udev_device_get_sysattr_value(usb, "idProduct"));
+        properties.usbModel = value(udev_device_get_sysattr_value(usb, "product"));
+        properties.usbSerial = value(udev_device_get_sysattr_value(usb, "serial"));
+        transport = AudioHostTransport::Usb;
+      } else if (udev_device_get_parent_with_subsystem_devtype(device, "pci", nullptr))
         transport = AudioHostTransport::Pci;
+      identity = alsaStableIdentity(properties);
       udev_device_unref(device);
+    } else {
+      identity = alsaStableIdentity(properties);
     }
     const std::string driver = snd_ctl_card_info_get_driver(cardInfo);
     if (driver == "Loopback") transport = AudioHostTransport::Virtual;
@@ -155,12 +273,10 @@ std::vector<AlsaEndpoint> alsaEndpoints() {
     snd_ctl_close(control);
   }
   if (context) udev_unref(context);
-  // Ambiguous stable identities are unusable. Never silently select a sibling
-  // interface with an identical serial/card identity after reconnect.
-  std::map<std::string, uint32_t> counts;
-  for (const auto& row : result) ++counts[row.info.uid];
-  std::erase_if(capabilities, [&](const auto& row) { return !counts.contains(row.first); });
-  std::erase_if(result, [&](const auto& row) { return counts[row.info.uid] != 1; });
+  alsaRemoveAmbiguousEndpoints(result);
+  std::set<std::string> present;
+  for (const auto& row : result) present.insert(row.info.uid);
+  std::erase_if(capabilities, [&](const auto& row) { return !present.contains(row.first); });
   alsaUniqueDefaults(result);
   return result;
 }
@@ -264,7 +380,20 @@ bool AlsaPcm::open(const std::string& name, bool capture, uint32_t needed,
       fail(snd_pcm_sw_params_get_boundary(software, &boundary)) ||
       fail(snd_pcm_sw_params_set_start_threshold(handle, software, boundary)) ||
       fail(snd_pcm_sw_params_set_avail_min(handle, software, period)) ||
+      fail(snd_pcm_sw_params_set_tstamp_mode(handle, software, SND_PCM_TSTAMP_ENABLE)) ||
+      fail(snd_pcm_sw_params_set_tstamp_type(
+          handle, software, SND_PCM_TSTAMP_TYPE_MONOTONIC)) ||
       fail(snd_pcm_sw_params(handle, software))) return false;
+  snd_pcm_tstamp_t mode = SND_PCM_TSTAMP_NONE;
+  snd_pcm_tstamp_type_t type = SND_PCM_TSTAMP_TYPE_GETTIMEOFDAY;
+  if (fail(snd_pcm_sw_params_current(handle, software)) ||
+      fail(snd_pcm_sw_params_get_tstamp_mode(software, &mode)) ||
+      fail(snd_pcm_sw_params_get_tstamp_type(software, &type))) return false;
+  if (mode != SND_PCM_TSTAMP_ENABLE || type != SND_PCM_TSTAMP_TYPE_MONOTONIC) {
+    error = "ALSA PCM did not retain monotonic timestamp configuration";
+    close();
+    return false;
+  }
   const int count = snd_pcm_poll_descriptors_count(handle);
   if (count <= 0 || count > 64) {
     error = "ALSA returned an invalid polling descriptor count";

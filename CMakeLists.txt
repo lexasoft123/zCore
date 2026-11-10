@@ -226,6 +226,28 @@ target_compile_features(zdsp_control PUBLIC cxx_std_20)
 target_include_directories(zdsp_control PUBLIC zdsp/include)
 target_link_libraries(zdsp_control PUBLIC SingZ::zdsp_api)
 
+# Optional consumer-linked portable routing, shared with LoopZ. Preparing a
+# route allocates on control; render is bounded and checked for heap activity.
+add_library(zcore_routing_callback STATIC EXCLUDE_FROM_ALL zdsp/src/control/routing_render.cpp)
+target_compile_features(zcore_routing_callback PUBLIC cxx_std_20)
+target_include_directories(zcore_routing_callback PUBLIC zcore/include)
+target_link_libraries(zcore_routing_callback PUBLIC SingZ::zdsp_runtime)
+set_target_properties(zcore_routing_callback PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE YES)
+singz_configure_realtime_target(zcore_routing_callback)
+add_library(zcore_routing STATIC EXCLUDE_FROM_ALL
+  zdsp/src/control/routing.cpp
+  zcore/src/routing/audio_history.cpp
+  zcore/src/routing/audio_resampler.cpp
+  zcore/src/routing/sample_clock.cpp
+  zcore/src/routing/sinc_kernel.cpp
+  zcore/src/routing/minimum_phase_kernel.cpp
+  zcore/src/routing/cached_fir_kernels.cpp)
+add_library(zCore::routing ALIAS zcore_routing)
+target_compile_features(zcore_routing PUBLIC cxx_std_20)
+target_include_directories(zcore_routing PUBLIC zcore/include)
+target_link_libraries(zcore_routing PUBLIC zcore_routing_callback SingZ::zdsp_runtime)
+set_target_properties(zcore_routing PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE YES)
+
 option(SINGZ_ENABLE_FFMPEG_CODECS "Enable pinned dynamic FFmpeg codecs" OFF)
 if(ZCORE_BUILD_MEDIA)
   add_subdirectory(third_party/native)
@@ -264,6 +286,24 @@ if(ZCORE_BUILD_ANALYSIS)
 endif()
 if(ZCORE_BUILD_TESTS)
   enable_testing()
+  add_executable(zcore_routing_tests tests/native/routing_tests.cpp)
+  target_compile_features(zcore_routing_tests PRIVATE cxx_std_20)
+  target_link_libraries(zcore_routing_tests PRIVATE zCore::routing)
+  if(MSVC)
+    target_compile_options(zcore_routing_tests PRIVATE /UNDEBUG)
+  else()
+    target_compile_options(zcore_routing_tests PRIVATE -UNDEBUG)
+  endif()
+  add_test(NAME zcore_routing_tests COMMAND zcore_routing_tests)
+  add_executable(zcore_routing_clock_tests tests/native/routing_clock_tests.cpp)
+  target_compile_features(zcore_routing_clock_tests PRIVATE cxx_std_20)
+  target_link_libraries(zcore_routing_clock_tests PRIVATE zCore::routing)
+  if(MSVC)
+    target_compile_options(zcore_routing_clock_tests PRIVATE /UNDEBUG)
+  else()
+    target_compile_options(zcore_routing_clock_tests PRIVATE -UNDEBUG)
+  endif()
+  add_test(NAME zcore_routing_clock_tests COMMAND zcore_routing_clock_tests)
   foreach(_test IN ITEMS zdsp_contract_tests streaming_window_source_tests zdsp_graph_tests)
     add_executable(${_test} zdsp/tests/${_test}.cpp)
     target_compile_features(${_test} PRIVATE cxx_std_20)

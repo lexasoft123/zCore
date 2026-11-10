@@ -18,6 +18,10 @@
   std::abort(); } } while (false)
 using namespace singz;
 using namespace std::chrono_literals;
+namespace singz {
+std::unique_ptr<AudioInputBackend> makeAlsaAudioInputBackendForTests(
+    const std::string& pcm, uint32_t channels);
+}
 namespace {
 static_assert(!std::is_copy_constructible_v<detail::AlsaCaptureLease>);
 template <class Predicate> bool until(Predicate predicate, uint32_t milliseconds = 2000) {
@@ -57,6 +61,94 @@ AudioHostConfig config(const std::string& output = "test-output") {
   result.maximumFrames = 1024;
   return result;
 }
+void usbIdentity() {
+  detail::AlsaIdentityProperties usb;
+  usb.cardId = "FLOW8";
+  usb.usb = true;
+  usb.usbVendor = "1397";
+  usb.usbProduct = "050C";
+  usb.usbModel = "FLOW 8";
+  usb.path = "platform-usb5-5-1";
+  usb.usbPath = "/sys/devices/platform/usb5/5-1";
+  const auto model = detail::alsaStableIdentity(usb);
+  auto replugged = usb;
+  replugged.cardId = "FLOW8_1";
+  replugged.path = "platform-usb3-3-1";
+  replugged.usbPath = "/sys/devices/platform/usb3/3-1";
+  CHECK(detail::alsaStableIdentity(replugged) == model);
+  CHECK(model.starts_with("usb-model:1397:050c:"));
+  // Containers may have no udev property database. Actual FLOW 8 USB sysattrs
+  // include a real serial, which must take priority over the model fallback.
+  usb.path = {};
+  usb.usbSerial = "A0-E6-F8-5B-DC-77";
+  const auto unit = detail::alsaStableIdentity(usb);
+  CHECK(unit.starts_with("usb-serial:1397:050c:"));
+  CHECK(unit != model);
+  replugged.usbSerial = usb.usbSerial;
+  CHECK(detail::alsaStableIdentity(replugged) == unit);
+  replugged.usbSerial = "another-unit";
+  CHECK(detail::alsaStableIdentity(replugged) != unit);
+  usb.serial = "Behringer_FLOW_8_A0-E6-F8-5B-DC-77";
+  usb.shortSerial = "A0-E6-F8-5B-DC-77";
+  CHECK(detail::alsaStableIdentity(usb) == "serial:" + std::string(usb.serial));
+  usb.serial = {};
+  usb.shortSerial = {};
+  usb.usbSerial = {};
+  auto otherModel = usb;
+  otherModel.usbModel = "FLOW:8";
+  CHECK(detail::alsaStableIdentity(otherModel) != model);
+  otherModel.usbVendor = "FFFF";
+  CHECK(detail::alsaStableIdentity(otherModel) != model);
+  otherModel.usbVendor = "1397";
+  otherModel.usbProduct = "050d";
+  CHECK(detail::alsaStableIdentity(otherModel) != model);
+  auto fallback = usb;
+  fallback.usbVendor = "139:";
+  CHECK(detail::alsaStableIdentity(fallback) == "sysfs:" + std::string(usb.usbPath));
+  fallback.path = "pci-audio";
+  CHECK(detail::alsaStableIdentity(fallback) == "path:pci-audio");
+  fallback.usb = false;
+  fallback.usbVendor = "1397";
+  CHECK(detail::alsaStableIdentity(fallback) == "path:pci-audio");
+  fallback.path = {};
+  CHECK(detail::alsaStableIdentity(fallback) == "id:FLOW8");
+
+  const auto endpoint = [](const std::string& identity, int card, int pcm) {
+    detail::AlsaEndpoint result;
+    result.info.uid = "alsa:" + identity + ":pcm:" + std::to_string(pcm);
+    result.info.inputChannels = 2;
+    result.info.outputChannels = 4;
+    result.pcm = "hw:" + std::to_string(card) + "," + std::to_string(pcm) + ",0";
+    return result;
+  };
+  const auto first = endpoint(model, 1, 0);
+  const auto moved = endpoint(model, 7, 0);
+  CHECK(first.info.uid == moved.info.uid && first.pcm != moved.pcm);
+  std::vector<detail::AlsaEndpoint> rows{first, endpoint(model, 1, 1)};
+  detail::alsaRemoveAmbiguousEndpoints(rows);
+  CHECK(rows.size() == 2); // Two PCMs of one unit remain addressable.
+  rows = {first, endpoint(model, 7, 1)};
+  detail::alsaRemoveAmbiguousEndpoints(rows);
+  CHECK(rows.empty()); // Twin units with different PCM layouts are unsafe too.
+  rows = {first, moved};
+  detail::alsaRemoveAmbiguousEndpoints(rows);
+  CHECK(rows.empty());
+  rows = {moved}; // After unplug/replug, capture and output recover the same UID.
+  detail::alsaRemoveAmbiguousEndpoints(rows);
+  detail::alsaUniqueDefaults(rows);
+  CHECK(rows.size() == 1 && rows[0].info.uid == first.info.uid);
+  CHECK(rows[0].info.defaultInput && rows[0].info.defaultOutput);
+  rows = {endpoint(unit, 1, 0), endpoint(detail::alsaStableIdentity(replugged), 7, 0)};
+  detail::alsaRemoveAmbiguousEndpoints(rows);
+  CHECK(rows.size() == 2); // Proven serials distinguish identical models.
+  rows = {endpoint(unit, 1, 0), endpoint(unit, 7, 1)};
+  detail::alsaRemoveAmbiguousEndpoints(rows);
+  CHECK(rows.empty()); // Repeated descriptor serials are not assumed unique.
+  rows = {endpoint("path:pci-audio", 1, 0), endpoint("path:pci-audio", 2, 0)};
+  detail::alsaRemoveAmbiguousEndpoints(rows);
+  CHECK(rows.empty()); // Existing duplicate-UID protection remains in force.
+}
+
 void conversion() {
   for (auto format : {SND_PCM_FORMAT_FLOAT_LE, SND_PCM_FORMAT_S32_LE,
        SND_PCM_FORMAT_S24_3LE, SND_PCM_FORMAT_S24_LE, SND_PCM_FORMAT_S16_LE}) {
@@ -123,11 +215,37 @@ void lifecycle() {
   CHECK(!real.open(config("alsa:missing"), Render::run, &observer).ok);
 }
 struct ShortWrites {
-  uint64_t frame{0};
-  uint32_t calls{0}, interrupted{0};
-  bool invalid{false};
+  using Operation = detail::AlsaOutputRecoveryOperation;
+  uint64_t frame{0}, failureFrame{4096}, primed{0};
+  uint32_t calls{0}, interrupted{0}, recoveryBlocks{0};
+  uint32_t recoveryPrepares{0}, recoveryWrites{0}, recoveryStarts{0};
+  uint32_t renders{0}, statusCalls{0}, statusCount{0}, statusSleepMs{0};
+  std::array<detail::AlsaPlaybackSnapshot, 8> statusSnapshots{};
+  std::array<int, 8> statusResults{};
+  std::array<uint64_t, 8> outputTimes{}, callbackTimes{};
+  std::array<bool, 8> outputValid{}, outputHardware{};
+  bool invalid{false}, oneShot{false}, injected{false};
+  bool failRestart{false};
   int failure{-EPIPE};
-  static bool render(void*, const AudioHostRenderBlock& block) noexcept {
+  Operation restartFailureOperation{Operation::Prepare};
+  snd_pcm_sframes_t restartFailure{-EIO};
+  static bool render(void* context, const AudioHostRenderBlock& block) noexcept {
+    auto& self = *static_cast<ShortWrites*>(context);
+    const auto index = self.renders++;
+    if (index < self.outputTimes.size()) {
+      self.outputTimes[index] = block.outputHostTimeNs;
+      self.callbackTimes[index] = block.callbackHostTimeNs;
+      self.outputValid[index] = block.outputTimestampValid;
+      self.outputHardware[index] = block.outputTimestampHardware;
+    }
+    const auto discontinuity = block.discontinuity &
+        (AudioHostDiscontinuityXRun | AudioHostDiscontinuityClockReanchored);
+    if (discontinuity) {
+      ++self.recoveryBlocks;
+      if (discontinuity != (AudioHostDiscontinuityXRun |
+          AudioHostDiscontinuityClockReanchored))
+        self.invalid = true;
+    }
     for (uint32_t i = 0; i < block.frames; ++i) {
       block.output[0][i] = float((block.outputFrame + i) % 251) / 512;
       block.output[1][i] = -.25f;
@@ -139,7 +257,10 @@ struct ShortWrites {
     ++self.calls;
     if (self.calls % 7 == 0) { ++self.interrupted; return -EINTR; }
     if (self.calls % 5 == 0) { ++self.interrupted; return -EAGAIN; }
-    if (self.frame >= 4096) return self.failure;
+    if (self.frame >= self.failureFrame && (!self.oneShot || !self.injected)) {
+      self.injected = true;
+      return self.failure;
+    }
     const uint32_t accepted = uint32_t(std::min<snd_pcm_uframes_t>(13, frames));
     const auto* bytes = static_cast<const unsigned char*>(data);
     for (uint32_t i = 0; i < accepted; ++i) {
@@ -152,19 +273,213 @@ struct ShortWrites {
     self.frame += accepted;
     return accepted;
   }
+  static snd_pcm_sframes_t recover(void* context, Operation operation,
+      const void* data, snd_pcm_uframes_t frames) {
+    auto& self = *static_cast<ShortWrites*>(context);
+    if (operation == Operation::Prepare) ++self.recoveryPrepares;
+    if (operation == Operation::Write) ++self.recoveryWrites;
+    if (operation == Operation::Start) ++self.recoveryStarts;
+    if (self.failRestart && self.restartFailureOperation == operation)
+      return self.restartFailure;
+    if (operation != Operation::Write) return 0;
+    const auto* bytes = static_cast<const unsigned char*>(data);
+    if (!bytes || !frames) self.invalid = true;
+    for (size_t i = 0; i < size_t(frames) * 8; ++i)
+      if (bytes[i] != 0) self.invalid = true;
+    const auto accepted = std::min<snd_pcm_uframes_t>(13, frames);
+    self.primed += accepted;
+    return accepted;
+  }
+  static int status(void* context, detail::AlsaPlaybackSnapshot& snapshot) {
+    auto& self = *static_cast<ShortWrites*>(context);
+    if (!self.statusCount) {
+      self.invalid = true;
+      return -ENOSYS;
+    }
+    if (self.statusCalls >= self.statusCount) return -EAGAIN;
+    const auto index = self.statusCalls++;
+    snapshot = self.statusSnapshots[index];
+    if (self.statusSleepMs)
+      std::this_thread::sleep_for(std::chrono::milliseconds(self.statusSleepMs));
+    return self.statusResults[index];
+  }
 };
 void shortTransfers() {
-  for (const int failure : {-EPIPE, -ENODEV, 0}) {
+  for (const int failure : {-ENODEV, 0, -ESTRPIPE, std::numeric_limits<int>::max()}) {
     ShortWrites observed; observed.failure = failure;
     AudioHost host(detail::makeAlsaAudioHostForTests("null", {}, ShortWrites::write, &observed));
-    CHECK(host.open(config(), ShortWrites::render, nullptr).ok && host.start().ok);
+    CHECK(host.open(config(), ShortWrites::render, &observed).ok && host.start().ok);
     const auto expected = failure == -ENODEV ? AudioHostState::DeviceLost : AudioHostState::Error;
     CHECK(until([&] { return host.status().state == expected; }));
-    CHECK(host.status().xruns == uint64_t(failure == -EPIPE));
+    CHECK(host.status().xruns == uint64_t(failure == -ESTRPIPE));
     CHECK(host.status().terminalReason == (failure == -ENODEV ?
         AudioHostTerminalReason::DeviceLost : AudioHostTerminalReason::ProviderFailure));
     host.stop();
     CHECK(!observed.invalid && observed.frame >= 4096 && observed.interrupted > 0);
+  }
+}
+void recoveredUnderrun() {
+  ShortWrites observed;
+  observed.oneShot = true;
+  observed.failureFrame = 4109;
+  AudioHost host(detail::makeAlsaAudioHostForTests(
+      "null", {}, ShortWrites::write, &observed, ShortWrites::recover));
+  CHECK(host.open(config(), ShortWrites::render, &observed).ok);
+  const auto buffer = host.status().diagnostics.outputBufferFrames;
+  CHECK(host.start().ok);
+  CHECK(until([&] { return host.status().xruns == 1 && host.status().callbacks >= 20; }));
+  CHECK(host.status().state == AudioHostState::Running);
+  CHECK(host.status().terminalReason == AudioHostTerminalReason::None);
+  CHECK(host.status().xruns == 1);
+  host.stop();
+  CHECK(observed.injected && observed.frame > observed.failureFrame);
+  CHECK(observed.recoveryBlocks == 1);
+  CHECK(observed.recoveryPrepares == 1 && observed.recoveryStarts == 1);
+  CHECK(observed.recoveryWrites == (buffer + 12) / 13 && observed.primed == buffer);
+  CHECK(!observed.invalid && observed.interrupted > 0);
+}
+void recoveryFailures() {
+  for (const auto operation : {ShortWrites::Operation::Prepare,
+       ShortWrites::Operation::Write, ShortWrites::Operation::Start}) {
+    ShortWrites observed;
+    observed.oneShot = true;
+    observed.failureFrame = 4109;
+    observed.failRestart = true;
+    observed.restartFailureOperation = operation;
+    observed.restartFailure = operation == ShortWrites::Operation::Write ? 0 : -EIO;
+    AudioHost host(detail::makeAlsaAudioHostForTests(
+        "null", {}, ShortWrites::write, &observed, ShortWrites::recover));
+    CHECK(host.open(config(), ShortWrites::render, &observed).ok);
+    const auto buffer = host.status().diagnostics.outputBufferFrames;
+    CHECK(host.start().ok);
+    CHECK(until([&] { return host.status().state == AudioHostState::Error; }));
+    CHECK(host.status().xruns == 1);
+    CHECK(host.status().terminalReason == AudioHostTerminalReason::ProviderFailure);
+    host.stop();
+    CHECK(observed.injected && observed.recoveryPrepares == 1);
+    const auto expectedWrites = operation == ShortWrites::Operation::Prepare ? 0 :
+        operation == ShortWrites::Operation::Write ? 1 : (buffer + 12) / 13;
+    CHECK(observed.recoveryWrites == expectedWrites);
+    CHECK(observed.recoveryStarts == uint32_t(operation == ShortWrites::Operation::Start));
+    CHECK(observed.primed == (operation == ShortWrites::Operation::Start ? buffer : 0));
+    CHECK(!observed.invalid);
+  }
+}
+detail::AlsaPlaybackSnapshot outputSnapshot(uint64_t timestampNs,
+    snd_pcm_sframes_t delay = 256) {
+  detail::AlsaPlaybackSnapshot result;
+  result.available = 1024;
+  result.time.tv_sec = static_cast<decltype(result.time.tv_sec)>(
+      timestampNs / 1000000000ull);
+  result.time.tv_nsec = static_cast<decltype(result.time.tv_nsec)>(
+      timestampNs % 1000000000ull);
+  result.delay = delay;
+  return result;
+}
+void playbackTimestampMath() {
+  const auto snapshot = outputSnapshot(100000000000ull);
+  constexpr uint64_t expected = 100005333333ull;
+  CHECK(detail::alsaPlaybackOutputHostNs(snapshot, 48000, 1024, 0, 0) == expected);
+  CHECK(detail::alsaPlaybackOutputHostNs(snapshot, 48000, 1024,
+      100000000000ull, expected) == 0);
+  CHECK(detail::alsaPlaybackOutputHostNs(snapshot, 48000, 1024,
+      100000000001ull, 0) == 0);
+  CHECK(detail::alsaPlaybackOutputHostNs(snapshot, 48000, 1024,
+      0, expected + 1) == 0);
+  const auto sameTimeMoreQueued = outputSnapshot(100000000000ull, 512);
+  CHECK(detail::alsaPlaybackOutputHostNs(sameTimeMoreQueued, 48000, 1024,
+      100000000000ull, expected) == 100010666666ull);
+  const auto advanced = outputSnapshot(100010000000ull);
+  CHECK(detail::alsaPlaybackOutputHostNs(advanced, 48000, 1024,
+      100000000000ull, expected) == 100015333333ull);
+  const auto atBudget = outputSnapshot(100000000000ull, 1024);
+  CHECK(detail::alsaPlaybackOutputHostNs(atBudget, 48000, 1024, 0, 0) == 100021333333ull);
+  const auto zero = outputSnapshot(0);
+  CHECK(detail::alsaPlaybackOutputHostNs(zero, 48000, 1024, 0, 0) == 0);
+  CHECK(detail::alsaPlaybackOutputHostNs(zero, 48000, 1024,
+      100000000000ull, expected) == 0);
+  const auto negativeDelay = outputSnapshot(100000000000ull, -1);
+  CHECK(detail::alsaPlaybackOutputHostNs(negativeDelay, 48000, 1024, 0, 0) == 0);
+  const auto unsupportedLookahead = outputSnapshot(100000000000ull, 1025);
+  CHECK(detail::alsaPlaybackOutputHostNs(unsupportedLookahead, 48000, 1024, 0, 0) == 0);
+  CHECK(detail::alsaPlaybackOutputHostNs(snapshot, 0, 1024, 0, 0) == 0);
+  CHECK(detail::alsaPlaybackOutputHostNs(snapshot, 48000, 0, 0, 0) == 0);
+  const auto overflow = outputSnapshot(std::numeric_limits<uint64_t>::max() - 1000);
+  CHECK(detail::alsaPlaybackOutputHostNs(overflow, 48000, 1024, 0, 0) == 0);
+}
+void outputStatusEstimates() {
+  ShortWrites observed;
+  observed.statusCount = 2;
+  observed.statusSnapshots[0] = outputSnapshot(100000000000ull);
+  observed.statusSnapshots[1] = outputSnapshot(100010000000ull);
+  observed.statusSleepMs = 2;
+  AudioHost host(detail::makeAlsaAudioHostForTests(
+      "null", {}, ShortWrites::write, &observed, nullptr, ShortWrites::status));
+  CHECK(host.open(config(), ShortWrites::render, &observed).ok && host.start().ok);
+  CHECK(until([&] { return host.status().callbacks >= 2; }));
+  CHECK(host.status().state == AudioHostState::Running);
+  host.stop();
+  CHECK(observed.renders == 2 && observed.statusCalls >= 2 && !observed.invalid);
+  CHECK(observed.outputValid[0] && observed.outputValid[1] &&
+      !observed.outputHardware[0] && !observed.outputHardware[1]);
+  CHECK(observed.outputTimes[0] == 100005333333ull &&
+      observed.outputTimes[1] == 100015333333ull);
+  CHECK(observed.callbackTimes[0] && observed.callbackTimes[1] &&
+      observed.callbackTimes[0] != observed.callbackTimes[1]);
+}
+void outputStatusUnavailableThenValid() {
+  ShortWrites observed;
+  observed.statusCount = 2;
+  observed.statusSnapshots[0] = outputSnapshot(100000000000ull, 1025);
+  observed.statusSnapshots[1] = outputSnapshot(100000000000ull);
+  AudioHost host(detail::makeAlsaAudioHostForTests(
+      "null", {}, ShortWrites::write, &observed, nullptr, ShortWrites::status));
+  CHECK(host.open(config(), ShortWrites::render, &observed).ok && host.start().ok);
+  CHECK(until([&] { return host.status().callbacks >= 2; }));
+  CHECK(host.status().state == AudioHostState::Running);
+  host.stop();
+  CHECK(observed.renders == 2 && !observed.invalid);
+  CHECK(!observed.outputValid[0] && observed.outputTimes[0] == 0 &&
+      observed.callbackTimes[0] != 0);
+  CHECK(observed.outputValid[1] && observed.outputTimes[1] == 100005333333ull &&
+      !observed.outputHardware[0] && !observed.outputHardware[1]);
+}
+void outputStatusXrunRecovery() {
+  ShortWrites observed;
+  observed.statusCount = 2;
+  observed.statusSnapshots[0] = outputSnapshot(100000000000ull, 0);
+  observed.statusSnapshots[0].state = SND_PCM_STATE_XRUN;
+  observed.statusSnapshots[0].available = 0;
+  observed.statusSnapshots[1] = outputSnapshot(100000000000ull);
+  AudioHost host(detail::makeAlsaAudioHostForTests(
+      "null", {}, ShortWrites::write, &observed, ShortWrites::recover,
+      ShortWrites::status));
+  CHECK(host.open(config(), ShortWrites::render, &observed).ok && host.start().ok);
+  CHECK(until([&] { return host.status().xruns == 1 && host.status().callbacks >= 1; }));
+  CHECK(host.status().state == AudioHostState::Running);
+  CHECK(host.status().terminalReason == AudioHostTerminalReason::None);
+  host.stop();
+  CHECK(observed.renders == 1 && observed.recoveryPrepares == 1 &&
+      observed.recoveryStarts == 1 && observed.recoveryBlocks == 1);
+  CHECK(observed.outputValid[0] && observed.outputTimes[0] == 100005333333ull &&
+      !observed.invalid);
+}
+void outputStatusTerminal() {
+  for (const auto state : {SND_PCM_STATE_SUSPENDED, SND_PCM_STATE_DISCONNECTED,
+       static_cast<snd_pcm_state_t>(999)}) {
+    ShortWrites observed;
+    observed.statusCount = 1;
+    observed.statusSnapshots[0] = outputSnapshot(100000000000ull, 0);
+    observed.statusSnapshots[0].state = state;
+    observed.statusSnapshots[0].available = 0;
+    AudioHost host(detail::makeAlsaAudioHostForTests(
+        "null", {}, ShortWrites::write, &observed, nullptr, ShortWrites::status));
+    CHECK(host.open(config(), ShortWrites::render, &observed).ok && host.start().ok);
+    const auto expected = state == SND_PCM_STATE_DISCONNECTED ?
+        AudioHostState::DeviceLost : AudioHostState::Error;
+    CHECK(until([&] { return host.status().state == expected; }));
+    host.stop();
+    CHECK(observed.renders == 0 && host.status().callbacks == 0 && !observed.invalid);
   }
 }
 bool captureCount(void* context, const float*, uint32_t, uint32_t,
@@ -195,6 +510,610 @@ void leases() {
   std::this_thread::sleep_for(10ms); CHECK(counts[1] == held);
   CHECK(leases[1]->start(error));
   CHECK(until([&] { return counts[1] > held; }));
+}
+struct BusObservation {
+  std::atomic<uint32_t> callbacks{0};
+  std::array<AudioInputTimestampQuality, 8> qualities{};
+  std::array<uint64_t, 8> first{}, delivery{};
+  std::atomic<bool> invalid{false};
+  static bool push(void* context, const AudioInputBusBlock& block) noexcept {
+    auto& self = *static_cast<BusObservation*>(context);
+    const auto index = self.callbacks.load(std::memory_order_relaxed);
+    if (!block.planes || block.channelCount != 2 || !block.frames ||
+        block.frames > block.capacityFrames || block.capacityFrames > 256 ||
+        !block.planes[0] || !block.planes[1])
+      self.invalid.store(true, std::memory_order_relaxed);
+    else
+      for (uint32_t frame = 0; frame < block.frames; ++frame)
+        if (std::abs(block.planes[0][frame] - .8F) > .00001F ||
+            std::abs(block.planes[1][frame] + .9F) > .00001F)
+          self.invalid.store(true, std::memory_order_relaxed);
+    if (index < self.qualities.size()) {
+      self.qualities[index] = block.quality;
+      self.first[index] = block.firstNs;
+      self.delivery[index] = block.deliveryNs;
+    }
+    self.callbacks.store(index + 1, std::memory_order_release);
+    return true;
+  }
+};
+struct BusScript {
+  uint32_t timestamps{0}, unknown{1};
+  static snd_pcm_sframes_t operation(void* context, detail::AlsaCaptureOperation action,
+      void* data, snd_pcm_uframes_t frames) {
+    auto& self = *static_cast<BusScript*>(context);
+    if (action == detail::AlsaCaptureOperation::Timestamp) {
+      ++self.timestamps;
+      if (self.unknown) { --self.unknown; return -EPIPE; }
+      auto& snapshot = *static_cast<detail::AlsaCaptureSnapshot*>(data);
+      const uint64_t timestamp = 100000000000ull + (self.timestamps - 1) * 1000000ull;
+      snapshot.available = 64;
+      snapshot.time.tv_sec = static_cast<decltype(snapshot.time.tv_sec)>(timestamp / 1000000000ull);
+      snapshot.time.tv_nsec = static_cast<decltype(snapshot.time.tv_nsec)>(timestamp % 1000000000ull);
+      return 0;
+    }
+    if (action != detail::AlsaCaptureOperation::Read) return 0;
+    auto* samples = static_cast<float*>(data);
+    const auto accepted = std::min<snd_pcm_uframes_t>(64, frames);
+    for (snd_pcm_uframes_t frame = 0; frame < accepted; ++frame) {
+      for (uint32_t channel = 0; channel < 10; ++channel) samples[frame * 10 + channel] = 0;
+      samples[frame * 10 + 8] = .8F;
+      samples[frame * 10 + 9] = -.9F;
+    }
+    return accepted;
+  }
+};
+struct MonoBusObservation {
+  std::atomic<uint32_t> callbacks{0};
+  std::atomic<bool> invalid{false};
+  static bool push(void* context, const float* mono, uint32_t frames, uint64_t, uint64_t,
+                   AudioInputTimestampQuality) noexcept {
+    auto& self = *static_cast<MonoBusObservation*>(context);
+    if (!mono || !frames || std::abs(mono[0] - .8F) > .00001F)
+      self.invalid.store(true, std::memory_order_relaxed);
+    ++self.callbacks;
+    return true;
+  }
+};
+struct UnsupportedInput final : AudioInputBackend {
+  AudioInputResult open(const AudioInputConfig&, AudioInputPush, void*) override { return {}; }
+  AudioInputResult start() override { return {}; }
+  void stop() override {}
+  bool takeFailure(std::string&) override { return false; }
+};
+void audioInputBus() {
+  BusObservation observed;
+  AudioInputBusConfig invalid{"test-bus-invalid", {8, 8}};
+  auto backend = makeAlsaAudioInputBackendForTests("null", 10);
+  CHECK(backend->openBus(invalid, BusObservation::push, &observed).status ==
+        AudioInputBusOpenStatus::Error);
+  invalid.channels = {};
+  CHECK(backend->openBus(invalid, BusObservation::push, &observed).status ==
+        AudioInputBusOpenStatus::Error);
+  invalid.channels.resize(kAudioInputBusMaxChannels + 1);
+  for (uint32_t c = 0; c < invalid.channels.size(); ++c) invalid.channels[c] = c;
+  CHECK(backend->openBus(invalid, BusObservation::push, &observed).status ==
+        AudioInputBusOpenStatus::Error);
+  invalid.channels = {10};
+  CHECK(backend->openBus(invalid, BusObservation::push, &observed).status ==
+        AudioInputBusOpenStatus::Error);
+  invalid.channels = {std::numeric_limits<uint32_t>::max()};
+  CHECK(backend->openBus(invalid, BusObservation::push, &observed).status ==
+        AudioInputBusOpenStatus::Error);
+  invalid.channels = {8, 9};
+  CHECK(backend->openBus(invalid, nullptr, &observed).status == AudioInputBusOpenStatus::Error);
+  UnsupportedInput unsupported;
+  CHECK(unsupported.openBus(invalid, BusObservation::push, &observed).status ==
+        AudioInputBusOpenStatus::Unsupported);
+
+  const AudioInputBusConfig selection{"test-selected-bus", {8, 9}};
+  backend = makeAlsaAudioInputBackendForTests("null", 10);
+  auto opened = backend->openBus(selection, BusObservation::push, &observed);
+  CHECK(opened.status == AudioInputBusOpenStatus::Ready && opened.result.ok &&
+        opened.result.sampleRate == 48000 && opened.result.deviceChannels >= 10);
+  BusObservation wrappedObserved;
+  auto wrappedBackend = makeAlsaAudioInputBackendForTests("null", 10);
+  const AudioInputBusConfig wrappedSelection{"test-selected-bus",
+      {std::numeric_limits<uint32_t>::max()}};
+  CHECK(wrappedBackend->openBus(wrappedSelection, BusObservation::push,
+        &wrappedObserved).status == AudioInputBusOpenStatus::Error);
+  auto mono = makeAlsaAudioInputBackendForTests("null", 10);
+  MonoBusObservation monoObserved;
+  CHECK(mono->open({"test-selected-bus", 8, 32}, MonoBusObservation::push, &monoObserved).ok);
+  std::string error;
+  BusScript script;
+  auto operations = detail::acquireAlsaCapture("test-selected-bus", "null", 2, 48000, 256,
+      captureCount, &monoObserved.callbacks, error);
+  CHECK(operations);
+  operations->setOperationsForTests(BusScript::operation, &script);
+  CHECK(backend->start().ok && mono->start().ok);
+  CHECK(until([&] { return observed.callbacks >= 3 && monoObserved.callbacks >= 1; }));
+  CHECK(observed.qualities[0] == AudioInputTimestampQuality::Unknown && observed.first[0] == 0);
+  CHECK(observed.qualities[1] == AudioInputTimestampQuality::CallbackEstimate &&
+        observed.first[1] != 0 && observed.delivery[1] != 0);
+  CHECK(!observed.invalid.load(std::memory_order_relaxed) &&
+        !monoObserved.invalid.load(std::memory_order_relaxed));
+  CHECK(backend->suspendPrepared());
+  const auto suspended = observed.callbacks.load();
+  std::this_thread::sleep_for(5ms);
+  CHECK(observed.callbacks == suspended);
+  CHECK(backend->start().ok);
+  CHECK(until([&] { return observed.callbacks > suspended; }));
+  backend->stop();
+  const auto stopped = observed.callbacks.load();
+  std::this_thread::sleep_for(5ms);
+  CHECK(observed.callbacks == stopped);
+
+  BusObservation reopened;
+  opened = backend->openBus(selection, BusObservation::push, &reopened);
+  CHECK(opened.status == AudioInputBusOpenStatus::Ready && backend->start().ok);
+  CHECK(until([&] { return reopened.callbacks >= 1; }));
+  CHECK(observed.callbacks == stopped &&
+        !reopened.invalid.load(std::memory_order_relaxed));
+  const auto monoBefore = monoObserved.callbacks.load();
+  backend->stop();
+  CHECK(until([&] { return monoObserved.callbacks > monoBefore; }));
+  mono->stop();
+  const auto drained = reopened.callbacks.load();
+  std::this_thread::sleep_for(5ms);
+  CHECK(reopened.callbacks == drained);
+}
+struct CaptureRecoveryObservation {
+  AudioInputRing ring{16, 256};
+  std::array<float, 256> mono{};
+  std::array<uint64_t, 8> sourceFrames{};
+  std::atomic<uint32_t> callbacks{0};
+  bool invalid{false};
+  static bool push(void* context, const float* input, uint32_t channels,
+                   uint32_t frames, uint64_t source, uint64_t firstSampleNs) noexcept {
+    auto& self = *static_cast<CaptureRecoveryObservation*>(context);
+    if (!frames || frames > self.mono.size() || !input || !channels) {
+      self.invalid = true;
+      return false;
+    }
+    for (uint32_t frame = 0; frame < frames; ++frame)
+      self.mono[frame] = input[size_t(frame) * channels];
+    const auto index = self.callbacks.load(std::memory_order_relaxed);
+    if (index < self.sourceFrames.size()) self.sourceFrames[index] = source;
+    self.callbacks.store(index + 1, std::memory_order_release);
+    // Only the initial metadata blocks enter the ring. Callback counting
+    // independently proves continuation without requiring queue admission.
+    if (index >= 4) return true;
+    const bool pushed = self.ring.push(self.mono.data(), frames, firstSampleNs,
+        detail::alsaMonotonicNs(), firstSampleNs ?
+            AudioInputTimestampQuality::CallbackEstimate :
+            AudioInputTimestampQuality::Unknown);
+    if (!pushed) self.invalid = true;
+    return pushed;
+  }
+};
+struct CaptureRecoveryScript {
+  using Operation = detail::AlsaCaptureOperation;
+  uint32_t reads{0}, prepares{0}, starts{0}, timestamps{0};
+  uint32_t injectAfter{0}, injections{1};
+  uint32_t timestampInjections{0}, delayReadMs{0};
+  uint32_t readEagain{0}, readEintr{0};
+  int readResult{-EPIPE}, recoveryResult{-EIO}, timestampResult{0};
+  snd_pcm_uframes_t timestampAvailable{64};
+  uint64_t fixedTimestampNs{0}, timestampStepNs{0};
+  bool failRecovery{false};
+  Operation recoveryFailureOperation{Operation::Prepare};
+  static snd_pcm_sframes_t operation(void* context, Operation action,
+      void* data, snd_pcm_uframes_t frames) {
+    auto& self = *static_cast<CaptureRecoveryScript*>(context);
+    if (action == Operation::Timestamp) {
+      ++self.timestamps;
+      if (self.timestampInjections) {
+        --self.timestampInjections;
+        return self.timestampResult;
+      }
+      auto& snapshot = *static_cast<detail::AlsaCaptureSnapshot*>(data);
+      const uint64_t timestampNs = self.fixedTimestampNs ?
+          self.fixedTimestampNs + (self.timestamps - 1) * self.timestampStepNs :
+          detail::alsaMonotonicNs();
+      snapshot.available = self.timestampAvailable;
+      snapshot.time.tv_sec = static_cast<decltype(snapshot.time.tv_sec)>(
+          timestampNs / 1000000000ull);
+      snapshot.time.tv_nsec = static_cast<decltype(snapshot.time.tv_nsec)>(
+          timestampNs % 1000000000ull);
+      return 0;
+    }
+    if (action == Operation::Prepare) ++self.prepares;
+    if (action == Operation::Start) ++self.starts;
+    if (action != Operation::Read) {
+      if (self.failRecovery && self.recoveryFailureOperation == action)
+        return self.recoveryResult;
+      return 0;
+    }
+    ++self.reads;
+    if (self.injections && self.reads > self.injectAfter) {
+      --self.injections;
+      return self.readResult;
+    }
+    if (self.readEagain) { --self.readEagain; return -EAGAIN; }
+    if (self.readEintr) { --self.readEintr; return -EINTR; }
+    if (self.delayReadMs)
+      std::this_thread::sleep_for(std::chrono::milliseconds(self.delayReadMs));
+    if (!data) return -EIO;
+    const auto accepted = std::min<snd_pcm_uframes_t>(64, frames);
+    std::memset(data, 0, size_t(accepted) * 8);
+    return accepted;
+  }
+};
+struct WideBusObservation {
+  uint32_t channels{0};
+  bool rejectThird{false};
+  std::atomic<uint32_t> callbacks{0};
+  std::atomic<bool> invalid{false};
+  std::array<AudioInputCaptureMetadata, 16> metadata{};
+  std::array<uint64_t, 16> xruns{};
+  std::atomic<uint64_t> latestGeneration{0};
+  static bool push(void* context, const AudioInputBusBlock& block) noexcept {
+    auto& self = *static_cast<WideBusObservation*>(context);
+    const auto index = self.callbacks.load(std::memory_order_relaxed);
+    if (!block.planes || block.channelCount != self.channels || !block.frames ||
+        block.frames > block.capacityFrames || block.capacityFrames > 256)
+      self.invalid.store(true, std::memory_order_relaxed);
+    else
+      for (uint32_t channel = 0; channel < self.channels; ++channel)
+        if (!block.planes[channel] ||
+            std::abs(block.planes[channel][0] - float(channel + 1) / 100.f) > .00001f)
+          self.invalid.store(true, std::memory_order_relaxed);
+    if (!block.capture.clockDomainId || !block.capture.streamGeneration ||
+        block.capture.sourceFrame % 64 || (block.capture.flags & AudioInputSourceFrameValid) == 0 ||
+        block.capture.sampleHostTimeNs != block.firstNs ||
+        block.capture.timestampQuality != block.quality)
+      self.invalid.store(true, std::memory_order_relaxed);
+    if (index < self.metadata.size()) {
+      self.metadata[index] = block.capture;
+      self.xruns[index] = block.xruns;
+    }
+    self.latestGeneration.store(block.capture.streamGeneration, std::memory_order_relaxed);
+    self.callbacks.store(index + 1, std::memory_order_release);
+    return !(self.rejectThird && index == 2);
+  }
+};
+struct WideBusScript {
+  uint32_t channels, reads{0}, injections{0}, injectAfter{0};
+  static snd_pcm_sframes_t operation(void* context, detail::AlsaCaptureOperation action, void* data,
+                                     snd_pcm_uframes_t frames) {
+    auto& self = *static_cast<WideBusScript*>(context);
+    if (action == detail::AlsaCaptureOperation::Timestamp) {
+      auto& snapshot = *static_cast<detail::AlsaCaptureSnapshot*>(data);
+      const uint64_t timestamp = 100000000000ull + uint64_t(self.reads) * 1333334;
+      snapshot.available = 64;
+      snapshot.time.tv_sec = static_cast<decltype(snapshot.time.tv_sec)>(timestamp / 1000000000ull);
+      snapshot.time.tv_nsec =
+          static_cast<decltype(snapshot.time.tv_nsec)>(timestamp % 1000000000ull);
+      return 0;
+    }
+    if (action != detail::AlsaCaptureOperation::Read) return 0;
+    if (self.injections && self.reads >= self.injectAfter) {
+      --self.injections;
+      return -EPIPE;
+    }
+    ++self.reads;
+    const auto accepted = std::min<snd_pcm_uframes_t>(64, frames);
+    auto* samples = static_cast<float*>(data);
+    for (uint32_t frame = 0; frame < accepted; ++frame)
+      for (uint32_t channel = 0; channel < self.channels; ++channel)
+        samples[size_t(frame) * self.channels + channel] = float(channel + 1) / 100.f;
+    return accepted;
+  }
+};
+void wideCaptureBus() {
+  for (uint32_t channels : {10u, kAudioInputBusMaxChannels}) {
+    const auto uid = "test-wide-bus-" + std::to_string(channels);
+    auto backend = makeAlsaAudioInputBackendForTests("null", channels);
+    AudioInputBusConfig selection{uid, {}};
+    selection.channels.resize(channels);
+    for (uint32_t channel = 0; channel < channels; ++channel) selection.channels[channel] = channel;
+    WideBusObservation observed;
+    observed.channels = channels;
+    observed.rejectThird = true;
+    CHECK(backend->openBus(selection, WideBusObservation::push, &observed).status ==
+          AudioInputBusOpenStatus::Ready);
+    std::atomic<uint32_t> physical{0};
+    std::string error;
+    auto operations = detail::acquireAlsaCapture(uid, "null", channels, 48000, 256, captureCount,
+                                                 &physical, error);
+    CHECK(operations);
+    WideBusScript script{channels};
+    operations->setOperationsForTests(WideBusScript::operation, &script);
+    CHECK(backend->start().ok && operations->start(error));
+    CHECK(until([&] { return observed.callbacks >= 5 && physical >= 5; }));
+    CHECK(backend->suspendPrepared());
+    const auto stopped = observed.callbacks.load();
+    const auto physicalBefore = physical.load();
+    CHECK(until([&] { return physical > physicalBefore; }));
+    CHECK(observed.callbacks == stopped && !observed.invalid);
+    CHECK(observed.metadata[0].sequence == 0 && observed.metadata[1].sequence == 1);
+    CHECK(observed.metadata[1].sourceFrame == observed.metadata[0].sourceFrame + 64);
+    CHECK(observed.metadata[0].streamGeneration == observed.metadata[1].streamGeneration);
+    CHECK(observed.metadata[0].discontinuity ==
+          AudioInputDiscontinuityReason::StreamGenerationChanged);
+    CHECK(observed.metadata[3].sequence == 3 &&
+          observed.metadata[3].sourceFrame == observed.metadata[2].sourceFrame + 64);
+    CHECK(observed.metadata[3].discontinuity == AudioInputDiscontinuityReason::SequenceGap);
+    const auto initialGeneration = observed.metadata[0].streamGeneration;
+    const auto beforeResume = observed.latestGeneration.load();
+    CHECK(backend->start().ok && until([&] { return observed.callbacks > stopped + 1; }));
+    CHECK(backend->suspendPrepared());
+    CHECK(observed.latestGeneration.load() != beforeResume);
+    // Restart only this subscriber: the physical peer must keep running.
+    WideBusObservation resumed;
+    resumed.channels = channels;
+    backend->stop();
+    CHECK(backend->openBus(selection, WideBusObservation::push, &resumed).status ==
+          AudioInputBusOpenStatus::Ready);
+    CHECK(backend->start().ok && until([&] { return resumed.callbacks >= 2; }));
+    backend->stop();
+    CHECK(resumed.metadata[0].streamGeneration != initialGeneration &&
+          resumed.metadata[0].sequence == 0 && !resumed.invalid);
+    operations->stop();
+  }
+  // Two recovered EPIPE events must survive the bus boundary independently
+  // of timestamp quality, with no fabricated count of missing physical frames.
+  const std::string uid = "test-wide-bus-recovery";
+  auto backend = makeAlsaAudioInputBackendForTests("null", 10);
+  AudioInputBusConfig selection{uid, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}};
+  WideBusObservation observed;
+  observed.channels = 10;
+  CHECK(backend->openBus(selection, WideBusObservation::push, &observed).status ==
+        AudioInputBusOpenStatus::Ready);
+  std::string error;
+  std::atomic<uint32_t> unused{0};
+  auto operations =
+      detail::acquireAlsaCapture(uid, "null", 10, 48000, 256, captureCount, &unused, error);
+  CHECK(operations);
+  WideBusScript script{10, 0, 2, 2};
+  operations->setOperationsForTests(WideBusScript::operation, &script);
+  CHECK(backend->start().ok && until([&] { return observed.callbacks >= 5; }));
+  backend->stop();
+  CHECK(!observed.invalid && observed.xruns[0] == 0 && observed.xruns[2] == 2 &&
+        operations->xruns() == 2);
+  CHECK(observed.metadata[2].sourceFrame == 128 && observed.metadata[2].sequence == 2);
+  CHECK(observed.metadata[2].streamGeneration != observed.metadata[1].streamGeneration);
+  CHECK(observed.metadata[2].discontinuity == AudioInputDiscontinuityReason::ClockReanchored &&
+        observed.metadata[2].sampleHostTimeNs == 0 &&
+        observed.metadata[2].timestampQuality == AudioInputTimestampQuality::Unknown);
+  CHECK(observed.metadata[3].streamGeneration == observed.metadata[2].streamGeneration &&
+        observed.metadata[3].timestampQuality == AudioInputTimestampQuality::CallbackEstimate);
+}
+
+void captureRecovery() {
+  CaptureRecoveryObservation firstObserved, secondObserved;
+  CaptureRecoveryScript script;
+  script.injectAfter = 2;
+  script.injections = 2;
+  std::string error;
+  auto first = detail::acquireAlsaCapture("test-capture-recovery", "null", 2,
+      48000, 256, CaptureRecoveryObservation::push, &firstObserved, error);
+  auto second = detail::acquireAlsaCapture("test-capture-recovery", "null", 2,
+      48000, 256, CaptureRecoveryObservation::push, &secondObserved, error);
+  CHECK(first && second);
+  first->setOperationsForTests(CaptureRecoveryScript::operation, &script);
+  CHECK(first->start(error) && second->start(error));
+  CHECK(until([&] { return firstObserved.callbacks >= 4 && secondObserved.callbacks >= 4; }));
+  CHECK(first->failure() == 0 && second->failure() == 0);
+  const auto continued = secondObserved.callbacks.load();
+  first->stop();
+  CHECK(until([&] { return secondObserved.callbacks > continued; }));
+  second->stop();
+  CHECK(script.reads >= 7 && script.prepares == 2 && script.starts == 2);
+  CHECK(firstObserved.sourceFrames[2] == 128 && firstObserved.sourceFrames[3] == 192);
+  CHECK(!firstObserved.invalid && !secondObserved.invalid);
+  CHECK(firstObserved.ring.overruns() == 0 && secondObserved.ring.overruns() == 0);
+  AudioInputBlockView block;
+  CHECK(firstObserved.ring.peek(block, 48000));
+  CHECK(block.capture.sequence == 0 && block.capture.sourceFrame == 0 &&
+      block.capture.discontinuity == AudioInputDiscontinuityReason::None &&
+      block.capture.sampleHostTimeNs != 0);
+  firstObserved.ring.consume();
+  CHECK(firstObserved.ring.peek(block, 48000));
+  CHECK(block.capture.sequence == 1 && block.capture.sourceFrame == 64 &&
+      block.capture.discontinuity == AudioInputDiscontinuityReason::None);
+  firstObserved.ring.consume();
+  CHECK(firstObserved.ring.peek(block, 48000));
+  CHECK(block.capture.sequence == 2 && block.capture.sourceFrame == 128 &&
+      block.capture.discontinuity == AudioInputDiscontinuityReason::TimestampQualityChanged &&
+      (block.capture.flags & AudioInputDiscontinuous) != 0 &&
+      block.capture.sampleHostTimeNs == 0 &&
+      block.capture.timestampQuality == AudioInputTimestampQuality::Unknown &&
+      (block.capture.flags & AudioInputSampleHostTimeValid) == 0 &&
+      (block.capture.flags & AudioInputTimestampQualityValid) == 0);
+  firstObserved.ring.consume();
+  CHECK(firstObserved.ring.peek(block, 48000));
+  CHECK(block.capture.sequence == 3 && block.capture.sourceFrame == 192 &&
+      block.capture.discontinuity == AudioInputDiscontinuityReason::TimestampQualityChanged &&
+      block.capture.sampleHostTimeNs != 0 &&
+      block.capture.timestampQuality == AudioInputTimestampQuality::CallbackEstimate &&
+      (block.capture.flags & AudioInputSampleHostTimeValid) != 0 &&
+      (block.capture.flags & AudioInputStaleAnchor) != 0);
+  firstObserved.ring.consume();
+}
+void captureRecoveryFailures() {
+  using Operation = CaptureRecoveryScript::Operation;
+  struct Case {
+    int readResult;
+    bool failRecovery;
+    Operation failureOperation;
+    int expected;
+    uint32_t prepares, starts;
+  };
+  const std::array<Case, 6> cases{{
+    {-ENODEV, false, Operation::Read, -ENODEV, 0, 0},
+    {-ESTRPIPE, false, Operation::Read, -ESTRPIPE, 0, 0},
+    {0, false, Operation::Read, -EIO, 0, 0},
+    {std::numeric_limits<int>::max(), false, Operation::Read, -EIO, 0, 0},
+    {-EPIPE, true, Operation::Prepare, -EIO, 1, 0},
+    {-EPIPE, true, Operation::Start, -EIO, 1, 1},
+  }};
+  for (size_t index = 0; index < cases.size(); ++index) {
+    const auto& test = cases[index];
+    CaptureRecoveryObservation observed;
+    CaptureRecoveryScript script;
+    script.readResult = test.readResult;
+    script.failRecovery = test.failRecovery;
+    script.recoveryFailureOperation = test.failureOperation;
+    std::string error;
+    auto lease = detail::acquireAlsaCapture(
+        "test-capture-terminal-" + std::to_string(index), "null", 2, 48000, 256,
+        CaptureRecoveryObservation::push, &observed, error);
+    CHECK(lease);
+    lease->setOperationsForTests(CaptureRecoveryScript::operation, &script);
+    CHECK(lease->start(error));
+    CHECK(until([&] { return lease->failure() == test.expected; }));
+    lease->stop();
+    CHECK(script.reads == 1 && script.prepares == test.prepares &&
+        script.starts == test.starts);
+    CHECK(observed.callbacks == 0 && observed.ring.overruns() == 0 && !observed.invalid);
+  }
+}
+void captureTimestampConfiguration() {
+  std::string error;
+  detail::AlsaPcm capture;
+  CHECK(capture.open("null", true, 2, 48000, 256, 1024, error));
+  snd_pcm_sw_params_t* software = nullptr;
+  snd_pcm_sw_params_alloca(&software);
+  snd_pcm_tstamp_t mode = SND_PCM_TSTAMP_NONE;
+  snd_pcm_tstamp_type_t type = SND_PCM_TSTAMP_TYPE_GETTIMEOFDAY;
+  CHECK(snd_pcm_sw_params_current(capture.handle, software) == 0);
+  CHECK(snd_pcm_sw_params_get_tstamp_mode(software, &mode) == 0);
+  CHECK(snd_pcm_sw_params_get_tstamp_type(software, &type) == 0);
+  CHECK(mode == SND_PCM_TSTAMP_ENABLE && type == SND_PCM_TSTAMP_TYPE_MONOTONIC);
+  detail::AlsaPcm output;
+  CHECK(output.open("null", false, 2, 48000, 256, 1024, error));
+  CHECK(snd_pcm_sw_params_current(output.handle, software) == 0);
+  CHECK(snd_pcm_sw_params_get_tstamp_mode(software, &mode) == 0);
+  CHECK(snd_pcm_sw_params_get_tstamp_type(software, &type) == 0);
+  CHECK(mode == SND_PCM_TSTAMP_ENABLE && type == SND_PCM_TSTAMP_TYPE_MONOTONIC);
+}
+void captureTimestampMath() {
+  detail::AlsaCaptureSnapshot snapshot;
+  snapshot.available = 3072;
+  snapshot.time.tv_sec = 100;
+  snapshot.time.tv_nsec = 0;
+  constexpr uint64_t expected = 99936000000ull;
+  CHECK(detail::alsaTimespecMonotonicNs(snapshot.time) == 100000000000ull);
+  CHECK(detail::alsaCaptureFirstSampleNs(snapshot, 48000, 16384, 0, 0) == expected);
+  CHECK(detail::alsaCaptureFirstSampleNs(snapshot, 48000, 16384,
+      100000000001ull, 0) == 0);
+  CHECK(detail::alsaCaptureFirstSampleNs(snapshot, 48000, 16384,
+      0, expected + 1) == 0);
+  CHECK(detail::alsaCaptureFirstSampleNs(snapshot, 48000, 16384,
+      0, expected) == 0);
+  auto advanced = snapshot;
+  advanced.available = 1536;
+  CHECK(detail::alsaCaptureFirstSampleNs(advanced, 48000, 16384,
+      100000000000ull, expected) == 99968000000ull);
+  auto invalid = snapshot;
+  invalid.time.tv_sec = 0;
+  invalid.time.tv_nsec = 0;
+  CHECK(detail::alsaCaptureFirstSampleNs(invalid, 48000, 16384, 0, 0) == 0);
+  invalid = snapshot;
+  invalid.time.tv_sec = -1;
+  CHECK(detail::alsaCaptureFirstSampleNs(invalid, 48000, 16384, 0, 0) == 0);
+  invalid = snapshot;
+  invalid.time.tv_nsec = 1000000000L;
+  CHECK(detail::alsaCaptureFirstSampleNs(invalid, 48000, 16384, 0, 0) == 0);
+  invalid = snapshot;
+  invalid.available = 0;
+  CHECK(detail::alsaCaptureFirstSampleNs(invalid, 48000, 16384, 0, 0) == 0);
+  invalid = snapshot;
+  invalid.available = 16385;
+  CHECK(detail::alsaCaptureFirstSampleNs(invalid, 48000, 16384, 0, 0) == 0);
+  invalid = snapshot;
+  invalid.time.tv_sec = 0;
+  invalid.time.tv_nsec = 1000;
+  CHECK(detail::alsaCaptureFirstSampleNs(invalid, 48000, 16384, 0, 0) == 0);
+  CHECK(detail::alsaCaptureFirstSampleNs(snapshot, 0, 16384, 0, 0) == 0);
+  CHECK(detail::alsaCaptureFirstSampleNs(snapshot, 48000, 0, 0, 0) == 0);
+  invalid = snapshot;
+  invalid.time.tv_sec = std::numeric_limits<decltype(invalid.time.tv_sec)>::max();
+  invalid.time.tv_nsec = 999999999L;
+  const auto seconds = static_cast<uint64_t>(invalid.time.tv_sec);
+  if (seconds > (std::numeric_limits<uint64_t>::max() - 999999999ull) / 1000000000ull)
+    CHECK(detail::alsaTimespecMonotonicNs(invalid.time) == 0);
+}
+void captureTimestampDelay() {
+  CaptureRecoveryObservation observed;
+  CaptureRecoveryScript script;
+  script.injections = 0;
+  script.fixedTimestampNs = 100000000000ull;
+  script.timestampAvailable = 512;
+  script.delayReadMs = 3;
+  std::string error;
+  auto lease = detail::acquireAlsaCapture("test-capture-fixed-htimestamp", "null",
+      2, 48000, 256, CaptureRecoveryObservation::push, &observed, error);
+  CHECK(lease);
+  lease->setOperationsForTests(CaptureRecoveryScript::operation, &script);
+  CHECK(lease->start(error));
+  CHECK(until([&] { return observed.callbacks >= 1; }));
+  CHECK(lease->failure() == 0);
+  lease->stop();
+  CHECK(!observed.invalid && observed.ring.overruns() == 0);
+  AudioInputBlockView block;
+  CHECK(observed.ring.peek(block, 48000));
+  CHECK(block.capture.sourceFrame == 0 && block.capture.sampleHostTimeNs == 99989333334ull &&
+      block.capture.timestampQuality == AudioInputTimestampQuality::CallbackEstimate &&
+      (block.capture.flags & AudioInputSampleHostTimeValid) != 0);
+  observed.ring.consume();
+}
+void captureTimestampRecovery() {
+  CaptureRecoveryObservation observed;
+  CaptureRecoveryScript script;
+  script.injections = 0;
+  script.timestampInjections = 1;
+  script.timestampResult = -EPIPE;
+  script.fixedTimestampNs = 100000000000ull;
+  script.timestampStepNs = 1000000ull;
+  script.readEagain = 1;
+  script.readEintr = 1;
+  std::string error;
+  auto lease = detail::acquireAlsaCapture("test-capture-htimestamp-recovery", "null",
+      2, 48000, 256, CaptureRecoveryObservation::push, &observed, error);
+  CHECK(lease);
+  lease->setOperationsForTests(CaptureRecoveryScript::operation, &script);
+  CHECK(lease->start(error));
+  CHECK(until([&] { return observed.callbacks >= 2; }));
+  CHECK(lease->failure() == 0);
+  lease->stop();
+  CHECK(script.timestamps >= 5 && script.reads >= 4 &&
+      script.readEagain == 0 && script.readEintr == 0 &&
+      script.prepares == 1 && script.starts == 1);
+  CHECK(!observed.invalid && observed.ring.overruns() == 0);
+  AudioInputBlockView block;
+  CHECK(observed.ring.peek(block, 48000));
+  CHECK(block.capture.sourceFrame == 0 && block.capture.sampleHostTimeNs == 0 &&
+      block.capture.timestampQuality == AudioInputTimestampQuality::Unknown &&
+      (block.capture.flags & AudioInputSampleHostTimeValid) == 0);
+  observed.ring.consume();
+  CHECK(observed.ring.peek(block, 48000));
+  CHECK(block.capture.sequence == 1 && block.capture.sourceFrame == 64 &&
+      block.capture.sampleHostTimeNs != 0 &&
+      block.capture.discontinuity == AudioInputDiscontinuityReason::TimestampQualityChanged &&
+      block.capture.timestampQuality == AudioInputTimestampQuality::CallbackEstimate &&
+      (block.capture.flags & AudioInputSampleHostTimeValid) != 0);
+  observed.ring.consume();
+}
+void captureTimestampApiFailure() {
+  CaptureRecoveryObservation observed;
+  CaptureRecoveryScript script;
+  script.injections = 0;
+  script.timestampInjections = 1;
+  script.timestampResult = -ENOSYS;
+  std::string error;
+  auto lease = detail::acquireAlsaCapture("test-capture-htimestamp-failure", "null",
+      2, 48000, 256, CaptureRecoveryObservation::push, &observed, error);
+  CHECK(lease);
+  lease->setOperationsForTests(CaptureRecoveryScript::operation, &script);
+  CHECK(lease->start(error));
+  CHECK(until([&] { return lease->failure() == -ENOSYS; }));
+  lease->stop();
+  CHECK(script.timestamps == 1 && script.reads == 0 &&
+      script.prepares == 0 && script.starts == 0);
+  CHECK(observed.callbacks == 0 && observed.ring.overruns() == 0 && !observed.invalid);
 }
 
 // A real snd-aloop peer. Its deterministic signal stays inside the kernel
@@ -339,7 +1258,12 @@ int main(int argc, char** argv) {
   if (argc == 3 && std::string(argv[1]) == "--loopback") loopback(argv[2]);
   else {
     CHECK(argc == 1);
-    conversion(); lifecycle(); shortTransfers(); leases();
-    std::puts("PASS ALSA conversion, lifecycle, failure and bounded capture lease tests");
+    usbIdentity(); conversion(); lifecycle(); shortTransfers(); recoveredUnderrun(); recoveryFailures();
+    playbackTimestampMath(); outputStatusEstimates(); outputStatusUnavailableThenValid();
+    outputStatusXrunRecovery(); outputStatusTerminal(); leases(); audioInputBus();
+    wideCaptureBus(); captureRecovery(); captureRecoveryFailures(); captureTimestampConfiguration();
+    captureTimestampMath(); captureTimestampDelay(); captureTimestampRecovery();
+    captureTimestampApiFailure();
+    std::puts("PASS ALSA conversion, lifecycle, output/capture recovery, timestamps and bounded capture lease tests");
   }
 }
