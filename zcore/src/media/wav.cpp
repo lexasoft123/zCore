@@ -1,5 +1,6 @@
 #include <zcore/media/wav.h>
 #include <zcore/base/file_compat.h>
+#include <zcore/base/utf8_file.h>
 
 #include <algorithm>
 #include <cmath>
@@ -30,7 +31,7 @@ bool WavWriter::open(const std::string& path, int sampleRate, int channels,
   channels_ = channels;
   finalized_ = false;
   if (existingFrames >= 0) {
-    f_ = std::fopen(path.c_str(), "r+b");
+    f_ = openUtf8(path, "r+b");
     if (f_ == nullptr) return false;
     // Backstop: the file must really hold every claimed frame — a resume
     // after a kill that outran stdio would otherwise zero-fill the gap.
@@ -42,7 +43,7 @@ bool WavWriter::open(const std::string& path, int sampleRate, int channels,
     frames_ = existingFrames;
     return fseeko(f_, 44 + existingFrames * channels_ * 2, SEEK_SET) == 0;
   }
-  f_ = std::fopen(path.c_str(), "wb");
+  f_ = openUtf8(path, "wb");
   if (f_ == nullptr) return false;
   frames_ = 0;
   uint8_t header[44] = {0};
@@ -118,7 +119,7 @@ namespace {
 // otherwise fail as "not a RIFF/WAVE file" while a WAV named .flac already
 // fails loudly — the asymmetric case is the one the suffix cannot catch.
 bool looksFlac(const std::string& path) {
-  std::FILE* f = std::fopen(path.c_str(), "rb");
+  std::FILE* f = openUtf8(path, "rb");
   if (f == nullptr) return false;
   unsigned char magic[4] = {0, 0, 0, 0};
   const size_t got = std::fread(magic, 1, 4, f);
@@ -222,7 +223,7 @@ bool walkHeader(std::FILE* f, WavHeader& h) {
 WavInfo readWavInfo(const std::string& path) {
   if (looksFlac(path)) return readFlacInfo(path);
   WavInfo out;
-  std::FILE* f = std::fopen(path.c_str(), "rb");
+  std::FILE* f = openUtf8(path, "rb");
   if (f == nullptr) {
     out.error = "cannot open";
     return out;
@@ -244,7 +245,7 @@ WavInfo readWavInfo(const std::string& path) {
 MonoWav readWavMono(const std::string& path) {
   if (looksFlac(path)) return readFlacMono(path);
   MonoWav out;
-  std::FILE* f = std::fopen(path.c_str(), "rb");
+  std::FILE* f = openUtf8(path, "rb");
   if (f == nullptr) {
     out.error = "cannot open";
     return out;
