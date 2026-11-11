@@ -5,6 +5,7 @@
 
 namespace zcore::routing {
 class SincKernel;
+class SincPhaseTables;
 class MinimumPhaseKernel;
 class UnityConvolutionPlan;
 enum class ResamplingFilter { LinearPhase, MinimumPhase };
@@ -35,13 +36,17 @@ struct ResampleOutput {
     uint32_t stride{1};
 };
 
-// Construct on control to prepare the immutable sinc table. read() owns only
+// Construct on control to prepare the immutable sinc tables. read() owns only
 // bounded stack state; concurrent callers need no shared cursor or workspace.
 // The provider supplies timestamp-addressed frames, including all filter wings.
 // Missing support is silent and counted, without a linear fallback or time shift.
 // The default keeps the existing symmetric kernel and aligned direct reads.
 // Wide equal-rate fractional blocks may evaluate that same kernel by FFT
 // convolution, with double intermediates and independent reader scratch.
+// Cached blocks whose phase changes per frame (clocks that drift, or 44.1 kHz
+// and 48 kHz either way) take that kernel's weights from phase tables when
+// their whole filter window is present, and sum them in single precision; the
+// result stays within 1e-6 of the double-precision sum.
 // Experimental minimum-phase mode uses past support only and always filters,
 // including integer-aligned targets, to keep its nonlinear phase continuous.
 class AudioResampler {
@@ -56,6 +61,7 @@ class AudioResampler {
 
   private:
     const SincKernel* const linear_;
+    const SincPhaseTables* const phases_;
     const MinimumPhaseKernel* const minimum_;
     const UnityConvolutionPlan* const convolution_;
 };

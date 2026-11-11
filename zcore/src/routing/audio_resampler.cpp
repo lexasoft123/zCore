@@ -1,6 +1,7 @@
 // Adapted from LoopZ portable routing; see zcore/src/routing/CAPTURE-PROVENANCE.md.
 #include <zcore/routing/audio_resampler.h>
 #include <zcore/routing/sinc_kernel.h>
+#include <zcore/routing/sinc_phase_table.h>
 #include <zcore/routing/minimum_phase_kernel.h>
 #include "unity_convolution.hpp"
 #include "cached_fir.hpp"
@@ -32,6 +33,7 @@ void silence(ResampleOutput output, uint32_t frames) noexcept {
 AudioResampler::AudioResampler() : AudioResampler(ResamplingFilter::LinearPhase) {}
 AudioResampler::AudioResampler(ResamplingFilter filter)
     : linear_(filter == ResamplingFilter::LinearPhase ? &SincKernel::prepared() : nullptr),
+      phases_(linear_ ? &SincPhaseTables::prepared() : nullptr),
       minimum_(filter == ResamplingFilter::MinimumPhase ? &MinimumPhaseKernel::prepared()
                                                         : nullptr),
       convolution_(linear_ ? &UnityConvolutionPlan::prepared() : nullptr) {
@@ -110,12 +112,13 @@ uint32_t AudioResampler::read(ResamplePosition read, ResampleOutput output, uint
     // A nearly equal measured clock is still a fractional FIR read. The cached
     // reader preserves its phase/rate exactly and declines direct-copy frames.
     if (linear_) {
-        if (const auto cached =
-                CachedFir::read(read, output, frames, *linear_, cutoff, getFrame, availableFrames))
+        const auto* const table = phases_->find(cutoff);
+        if (const auto cached = CachedFir::read(read, output, frames, *linear_, cutoff, getFrame,
+                                                availableFrames, table))
             return *cached;
         if (output.channels.size() <= 2)
             if (const auto cached = CachedFir::readWindow<512, 2, false>(
-                    read, output, frames, *linear_, cutoff, getFrame, availableFrames))
+                    read, output, frames, *linear_, cutoff, getFrame, availableFrames, table))
                 return *cached;
     }
 
