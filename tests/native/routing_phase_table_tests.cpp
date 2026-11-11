@@ -21,6 +21,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -382,10 +383,15 @@ void framePlacementIsExact() {
     CHECK(FramePositions(10, -10.5L, 1).at(1)->center == 0);
     CHECK(FramePositions(UINT64_MAX - 8, 0.25L, 1).at(6)->center == UINT64_MAX - 2);
     CHECK(!FramePositions(UINT64_MAX - 8, 0.25L, 1).at(7));
+    // An anchor at the counter's limit has nothing at or above it.
+    CHECK(!FramePositions(UINT64_MAX, 0.5L, 1).at(0));
+    CHECK(FramePositions(UINT64_MAX, -1.5L, 1).at(0)->center == UINT64_MAX - 2);
     // Arguments outside the reduced form use the direct sum.
     const FramePositions far((uint64_t{1} << 63) + 100, -0x1p63L, 1);
     CHECK(far.at(0) && far.at(0)->center == 100 && far.at(0)->fraction == 0);
     CHECK(!FramePositions(5, static_cast<long double>(INFINITY), 1).at(0));
+    CHECK(!FramePositions(UINT64_MAX - 1, -0x1p64L, 1).at(0));
+    CHECK(!FramePositions(0, 0x1p64L, 1).at(0));
     std::printf("Frame placement exact on %llu dyadic and %llu reference frames; naive control "
                 "misplaces %llu\n",
                 4000ULL * 8, static_cast<unsigned long long>(compared),
@@ -602,11 +608,10 @@ double requiredExactDb(Wave wave) {
     }
     return 0;
 }
-void resampledAudioMatchesExactReader() {
+void resampledAudioMatchesExactReader(bool printEveryCase) {
     const AudioResampler resampler;
     const auto& tables = SincPhaseTables::prepared();
-    // Set ZCORE_TEST_VERBOSE to print every case's measurement.
-    const bool verbose = std::getenv("ZCORE_TEST_VERBOSE") != nullptr;
+    const bool verbose = printEveryCase;
     // Fixed ratios, then source clocks that wander and jitter between blocks
     // (ppm: offset, slow wander, per-block jitter) across the tables' range.
     const Stream streams[] = {
@@ -964,11 +969,12 @@ void historyFollowsDriftingClocks() {
 }
 } // namespace
 
-int main() {
+// Pass "verbose" to print the measurement of every stream and signal.
+int main(int argc, char** argv) {
     weightsMatchKernel();
     convolveMatchesWeights();
     framePlacementIsExact();
-    resampledAudioMatchesExactReader();
+    resampledAudioMatchesExactReader(argc > 1 && std::string_view(argv[1]) == "verbose");
     sineDistortionIsUnchanged();
     fallbacksKeepExactReader();
     historyFollowsDriftingClocks();

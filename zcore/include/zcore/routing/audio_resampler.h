@@ -45,8 +45,8 @@ struct ResampleOutput {
 // convolution, with double intermediates and independent reader scratch.
 // Cached blocks whose phase changes per frame (clocks that drift, or 44.1 kHz
 // and 48 kHz either way) take that kernel's weights from phase tables when
-// their whole filter window is present, and sum them in single precision; the
-// result stays within 1e-6 of the double-precision sum.
+// their whole filter window is present, and sum them in single precision: for
+// samples within full scale, within 1e-6 of the double-precision sum.
 // Experimental minimum-phase mode uses past support only and always filters,
 // including integer-aligned targets, to keep its nonlinear phase continuous.
 class AudioResampler {

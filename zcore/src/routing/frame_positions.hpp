@@ -23,7 +23,8 @@ class FramePositions {
     static constexpr uint32_t kMaximumFrames = 1u << 26;
 
     FramePositions(uint64_t anchor, long double offset, double step) noexcept
-        : anchor_(anchor), offset_(offset), step_(step) {
+        : anchor_(anchor), room_(anchor == UINT64_MAX ? 0 : UINT64_MAX - anchor - 1),
+          offset_(offset), step_(step) {
         const long double whole = std::floor(offset);
         // Offsets this large have no fraction left; the direct sum handles
         // them, with every other unusual argument.
@@ -55,7 +56,10 @@ class FramePositions {
         // The sum can round up to a whole frame that it has not reached.
         if (error < 0 && value == frames)
             frames -= 1;
-        return beside(whole_ + static_cast<int64_t>(frames), (value - frames) + error);
+        const int64_t whole = whole_ + static_cast<int64_t>(frames);
+        const double fraction = (value - frames) + error;
+        return whole < 0 ? below(uint64_t{0} - static_cast<uint64_t>(whole), fraction)
+                         : above(static_cast<uint64_t>(whole), fraction);
     }
 
   private:
@@ -68,29 +72,30 @@ class FramePositions {
         const double part = value - a;
         return {value, (a - (value - part)) + (b - part)};
     }
-    std::optional<Position> beside(int64_t whole, double fraction) const noexcept {
-        if (whole < 0) {
-            const auto back = uint64_t{0} - static_cast<uint64_t>(whole);
-            if (back > anchor_)
-                return std::nullopt;
-            return Position{anchor_ - back, fraction};
-        }
-        if (static_cast<uint64_t>(whole) >= UINT64_MAX - anchor_ - 1)
+    // The source frame `back` frames below the anchor, or `ahead` frames above
+    // it; the last two frames of the counter stay unused, as before.
+    std::optional<Position> below(uint64_t back, double fraction) const noexcept {
+        if (back > anchor_)
             return std::nullopt;
-        return Position{anchor_ + static_cast<uint64_t>(whole), fraction};
+        return Position{anchor_ - back, fraction};
+    }
+    std::optional<Position> above(uint64_t ahead, double fraction) const noexcept {
+        if (ahead >= room_)
+            return std::nullopt;
+        return Position{anchor_ + ahead, fraction};
     }
     std::optional<Position> direct(uint32_t frame) const noexcept {
         const auto offset = offset_ + static_cast<long double>(frame) * step_;
         const auto whole = std::floor(offset);
-        if (!(whole >= -static_cast<long double>(anchor_) &&
-              whole < static_cast<long double>(UINT64_MAX - anchor_ - 1)))
+        // Beyond the 64-bit counter (or not a number) is beside no anchor.
+        if (!(whole > -0x1p64L && whole < 0x1p64L))
             return std::nullopt;
-        return Position{whole < 0 ? anchor_ - static_cast<uint64_t>(-whole)
-                                  : anchor_ + static_cast<uint64_t>(whole),
-                        static_cast<double>(offset - whole)};
+        const auto fraction = static_cast<double>(offset - whole);
+        return whole < 0 ? below(static_cast<uint64_t>(-whole), fraction)
+                         : above(static_cast<uint64_t>(whole), fraction);
     }
 
-    uint64_t anchor_;
+    uint64_t anchor_, room_;
     long double offset_;
     double step_;
     int64_t whole_{};
