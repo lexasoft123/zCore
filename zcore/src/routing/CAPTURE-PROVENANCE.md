@@ -37,9 +37,15 @@ on purpose. Changes after the port, by zCore commit:
 | `08e1c69` | `cached_fir.hpp`: AArch64 Advanced SIMD `dotPair` sharing weight loads across channels. |
 | `b941c55` | `sinc_kernel.h`: table lookup without wide-integer round trips (bit-identical results). |
 | `d7fd3a4` | `sinc_kernel.h`, `cached_fir.hpp`: batched `fillCoefficients` (AArch64 SIMD) and a 32-frame minimum for drifting mono/stereo reads. |
+| `8b6de0e` | `cached_fir.hpp`, `audio_resampler.cpp`, `audio_resampler.h`: whole-window cached reads take their weights from `SincPhaseTable` and sum in single precision; frame positions come from `frame_positions.hpp` instead of a `long double` sum per frame. `sinc_phase_table.h`, `sinc_phase_table.cpp` and `frame_positions.hpp` are new in zCore, not ported. |
+| `c3463d7` | `frame_positions.hpp`: positions beside the limits of the 64-bit frame counter are compared in integers. `audio_resampler.h`: comment only. |
 
 Commits that touch only `zcore/include/zcore/device/audio_input_backend.h`
 (not a ported routing file) are not listed. Numerical checks live in
 `tests/native/routing_clock_tests.cpp`: a bit-exact sinc lookup, batched
 weights against the scalar formula, and cached FIR reads against the uncached
-reference by SNR. They are not inferred from these hashes.
+reference by SNR. `tests/native/routing_phase_table_tests.cpp` checks the phase
+tables against the kernel's definition, the table reader against the exact
+reader by SNR and THD+N, and frame placement against integer arithmetic; each
+check also has to reject a degraded input. They are not inferred from these
+hashes.

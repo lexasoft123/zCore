@@ -240,6 +240,7 @@ add_library(zcore_routing STATIC EXCLUDE_FROM_ALL
   zcore/src/routing/audio_resampler.cpp
   zcore/src/routing/sample_clock.cpp
   zcore/src/routing/sinc_kernel.cpp
+  zcore/src/routing/sinc_phase_table.cpp
   zcore/src/routing/minimum_phase_kernel.cpp
   zcore/src/routing/cached_fir_kernels.cpp)
 add_library(zCore::routing ALIAS zcore_routing)
@@ -304,6 +305,17 @@ if(ZCORE_BUILD_TESTS)
     target_compile_options(zcore_routing_clock_tests PRIVATE -UNDEBUG)
   endif()
   add_test(NAME zcore_routing_clock_tests COMMAND zcore_routing_clock_tests)
+  # Reaches the cached reader directly, to compare it with a degraded table.
+  add_executable(zcore_routing_phase_table_tests tests/native/routing_phase_table_tests.cpp)
+  target_compile_features(zcore_routing_phase_table_tests PRIVATE cxx_std_20)
+  target_include_directories(zcore_routing_phase_table_tests PRIVATE zcore/src/routing)
+  target_link_libraries(zcore_routing_phase_table_tests PRIVATE zCore::routing)
+  if(MSVC)
+    target_compile_options(zcore_routing_phase_table_tests PRIVATE /UNDEBUG)
+  else()
+    target_compile_options(zcore_routing_phase_table_tests PRIVATE -UNDEBUG)
+  endif()
+  add_test(NAME zcore_routing_phase_table_tests COMMAND zcore_routing_phase_table_tests)
   foreach(_test IN ITEMS zdsp_contract_tests streaming_window_source_tests zdsp_graph_tests)
     add_executable(${_test} zdsp/tests/${_test}.cpp)
     target_compile_features(${_test} PRIVATE cxx_std_20)
@@ -376,6 +388,9 @@ if(ZCORE_BUILD_BENCHMARKS)
   target_compile_features(zdsp_builtin_benchmark PRIVATE cxx_std_20)
   target_include_directories(zdsp_builtin_benchmark PRIVATE zdsp/include zdsp/src/runtime)
   target_link_libraries(zdsp_builtin_benchmark PRIVATE SingZ::zdsp_runtime)
+  add_executable(zcore_routing_resampler_benchmark zcore/benchmarks/routing_resampler_benchmark.cpp)
+  target_compile_features(zcore_routing_resampler_benchmark PRIVATE cxx_std_20)
+  target_link_libraries(zcore_routing_resampler_benchmark PRIVATE zCore::routing)
 endif()
 
 # Preserve the manifest interfaces consumed by existing SingZ build checks.

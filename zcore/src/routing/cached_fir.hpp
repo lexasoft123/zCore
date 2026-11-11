@@ -2,8 +2,10 @@
 #pragma once
 #include "resample_scratch.hpp"
 #include "cached_fir_kernels.hpp"
+#include "frame_positions.hpp"
 #include <zcore/routing/audio_resampler.h>
 #include <zcore/routing/sinc_kernel.h>
+#include <zcore/routing/sinc_phase_table.h>
 #include <array>
 #include <algorithm>
 #include <cmath>
@@ -97,14 +99,26 @@ class CachedFir {
     }
 
   public:
+    // A nonzero sample below this (-300 dB) keeps its window on the double
+    // sums: its single-precision products with small weights would be
+    // subnormal, which x64 processors handle by a slow microcode assist.
+    static constexpr float kFaintSample = 1e-15f;
     // One source lookup per frame across the whole block, then contiguous dot
     // products with double intermediates. Independent partial sums change only
     // rounding order. Only baseline x64 SSE2/AArch64 SIMD; no shared mutable state.
+    //
+    // A changing fractional phase needs new filter weights for every output
+    // frame. When the whole window is present and a prepared phase table
+    // covers this cutoff, it supplies them from contiguous rows and the sums
+    // are accumulated in single precision; SincKernel remains the path for
+    // partial windows, other cutoffs, any frame whose sum is not finite, and
+    // windows with samples faint enough to make those sums subnormal.
     template <unsigned capacity, unsigned channelCapacity, bool fixedPhase, class Provider>
     static ZCORE_ROUTING_READER_NOINLINE std::optional<uint32_t>
     readWindow(ResamplePosition read, ResampleOutput output, uint32_t frames,
                const SincKernel& kernel, double cutoff, Provider& provider,
-               std::span<uint8_t> availableFrames) noexcept {
+               std::span<uint8_t> availableFrames,
+               const SincPhaseTable* table = nullptr) noexcept {
         // Timestamped history can split a mono/stereo block at clock-segment
         // boundaries. The same bounded FIR also covers these short fragments.
         constexpr uint32_t minimumFrames = !fixedPhase && channelCapacity == 2 ? 32 : 128;
@@ -122,17 +136,15 @@ class CachedFir {
         uint64_t first = UINT64_MAX, last = 0;
         const auto step = read.sourceRate / read.outputRate;
         const bool sameRate = std::abs(read.sourceRate - read.outputRate) <= read.outputRate * 2e-9;
+        const detail::FramePositions positions(read.anchor, read.offset, step);
         for (uint32_t frame = 0; frame < frames; ++frame) {
-            const auto offset = read.offset + static_cast<long double>(frame) * step;
-            const auto whole = std::floor(offset);
-            if (whole < -static_cast<long double>(read.anchor) ||
-                whole >= static_cast<long double>(UINT64_MAX - read.anchor - 1))
+            const auto position = positions.at(frame);
+            if (!position)
                 return std::nullopt;
-            const auto center = whole < 0 ? read.anchor - static_cast<uint64_t>(-whole)
-                                          : read.anchor + static_cast<uint64_t>(whole);
+            const auto center = position->center;
             if (center < radius || center > UINT64_MAX - radius)
                 return std::nullopt;
-            const auto fraction = static_cast<double>(offset - whole);
+            const auto fraction = position->fraction;
             // Near-integer unity reads use the existing exact sample-copy path.
             // Decline the complete block before reading its provider if any
             // frame needs that behavior; mixed direct/FIR blocks stay tiled.
@@ -164,15 +176,19 @@ class CachedFir {
         std::array<bool, channelCapacity> nonzero{};
         std::array<ResampleFrame, capacity> present;
         std::array<float, kMaximumRoutingChannels> source{};
-        bool allAvailable = true;
+        bool allAvailable = true, faint = false;
         for (uint32_t frame = 0; frame < windowFrames; ++frame) {
             present[frame] = provider(first + frame, source);
             allAvailable =
                 allAvailable && present[frame].valid && present[frame].availableChannels >= count;
             for (size_t channel = 0; channel < count; ++channel) {
                 samples[channel][frame] = present[frame].valid ? source[channel] : 0;
-                if constexpr (fixedPhase)
+                if constexpr (fixedPhase) {
                     nonzero[channel] = nonzero[channel] || samples[channel][frame] != 0;
+                } else {
+                    const auto magnitude = std::abs(samples[channel][frame]);
+                    faint = faint || (magnitude != 0 && magnitude < kFaintSample);
+                }
             }
         }
         std::array<double, capacity> weights;
@@ -183,10 +199,68 @@ class CachedFir {
                     kernel.coefficient(double(tap) - radius - targets[0].fraction, cutoff);
                 fixedNormalization += weights[tap];
             }
+        // Table reads cover whole groups of taps: up to fifteen frames past
+        // the filter, which the row padding holds as silence.
+        static_assert(rowPadding >= 16 &&
+                      (fixedPhase || capacity <= SincPhaseTable::kMaximumTaps));
+        const SincPhaseTable* const phases =
+            !fixedPhase && allAvailable && !faint ? table : nullptr;
+        std::array<float, fixedPhase ? 1 : capacity + rowPadding> phaseWeights;
+        if (phases)
+            for (size_t channel = 0; channel < count; ++channel)
+                std::fill_n(samples[channel].data() + windowFrames, rowPadding, 0.0f);
+        // False leaves the frame to the exact reader below.
+        const auto readPhase = [&](uint32_t frame, double fraction, uint32_t begin) {
+            std::array<double, channelCapacity> sums;
+            double normalization;
+            if (count == 1) {
+                const auto single =
+                    phases->convolve(radius, fraction, cutoff, samples[0].data() + begin);
+                sums[0] = single.a;
+                normalization = single.weights;
+            } else if (count == 2) {
+                const auto pair = phases->convolve(radius, fraction, cutoff,
+                                                   samples[0].data() + begin,
+                                                   samples[1].data() + begin);
+                sums[0] = pair.a;
+                sums[1] = pair.b;
+                normalization = pair.weights;
+            } else {
+                normalization = phases->weights(radius, fraction, cutoff, phaseWeights);
+                const auto padded = SincPhaseTable::paddedTaps(radius);
+                size_t channel = 0;
+                for (; channel + 1 < count; channel += 2) {
+                    const auto pair = SincPhaseTable::dotPair(
+                        samples[channel].data() + begin, samples[channel + 1].data() + begin,
+                        phaseWeights.data(), padded);
+                    sums[channel] = pair[0];
+                    sums[channel + 1] = pair[1];
+                }
+                if (channel < count)
+                    sums[channel] = SincPhaseTable::dot(samples[channel].data() + begin,
+                                                        phaseWeights.data(), padded);
+            }
+            if (!(normalization >= .5))
+                return false;
+            const auto scale = 1 / normalization;
+            // The ordered comparison also rejects NaN and infinity, which a
+            // single-precision sum reaches before the double sum would.
+            for (size_t channel = 0; channel < count; ++channel)
+                if (!(std::abs(sums[channel] * scale) <= std::numeric_limits<float>::max()))
+                    return false;
+            for (size_t channel = 0; channel < count; ++channel)
+                output.channels[channel][frame * output.stride] =
+                    static_cast<float>(sums[channel] * scale);
+            if (!availableFrames.empty())
+                availableFrames[frame] = 1;
+            return true;
+        };
         uint32_t missing = 0;
         for (uint32_t frame = 0; frame < frames; ++frame) {
             const auto& target = targets[frame];
             const auto begin = static_cast<uint32_t>(target.center - radius - first);
+            if (phases && readPhase(frame, target.fraction, begin))
+                continue;
             double normalization = fixedPhase && allAvailable ? fixedNormalization : 0;
             bool complete = true, available = true;
             const auto scanCoverage = [&] {
@@ -258,8 +332,8 @@ class CachedFir {
     template <class Provider>
     static std::optional<uint32_t> read(ResamplePosition position, ResampleOutput output,
                                         uint32_t frames, const SincKernel& kernel, double cutoff,
-                                        Provider& provider,
-                                        std::span<uint8_t> availableFrames) noexcept {
+                                        Provider& provider, std::span<uint8_t> availableFrames,
+                                        const SincPhaseTable* table = nullptr) noexcept {
         const auto step = position.sourceRate / position.outputRate;
         // Exact integer decimation keeps one filter phase throughout the block.
         // A separate bounded workspace covers the wider 2:1/4:1 support without
@@ -269,13 +343,13 @@ class CachedFir {
                                              availableFrames);
         if (output.channels.size() >= 16)
             return readWindow<512, kMaximumRoutingChannels, false>(
-                position, output, frames, kernel, cutoff, provider, availableFrames);
+                position, output, frames, kernel, cutoff, provider, availableFrames, table);
         // Multichannel microphone interfaces also need the cached fractional
         // reader when their measured clock drifts near the output rate. Keep
         // stereo dispatch and exact integer decimation on their existing paths.
         if (output.channels.size() >= 3)
             return readWindow<512, 16, false>(
-                position, output, frames, kernel, cutoff, provider, availableFrames);
+                position, output, frames, kernel, cutoff, provider, availableFrames, table);
         return std::nullopt;
     }
 };
