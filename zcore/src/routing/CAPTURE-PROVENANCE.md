@@ -37,7 +37,8 @@ on purpose. Changes after the port, by zCore commit:
 | `08e1c69` | `cached_fir.hpp`: AArch64 Advanced SIMD `dotPair` sharing weight loads across channels. |
 | `b941c55` | `sinc_kernel.h`: table lookup without wide-integer round trips (bit-identical results). |
 | `d7fd3a4` | `sinc_kernel.h`, `cached_fir.hpp`: batched `fillCoefficients` (AArch64 SIMD) and a 32-frame minimum for drifting mono/stereo reads. |
-| `8b6de0e` | `cached_fir.hpp`, `audio_resampler.cpp`: whole-window cached reads take their weights from `SincPhaseTable` and sum in single precision; frame positions come from `frame_positions.hpp` instead of a `long double` sum per frame. `sinc_phase_table.h`, `sinc_phase_table.cpp` and `frame_positions.hpp` are new in zCore, not ported. |
+| `8b6de0e` | `cached_fir.hpp`, `audio_resampler.cpp`, `audio_resampler.h`: whole-window cached reads take their weights from `SincPhaseTable` and sum in single precision; frame positions come from `frame_positions.hpp` instead of a `long double` sum per frame. `sinc_phase_table.h`, `sinc_phase_table.cpp` and `frame_positions.hpp` are new in zCore, not ported. |
+| `c3463d7` | `frame_positions.hpp`: positions beside the limits of the 64-bit frame counter are compared in integers. `audio_resampler.h`: comment only. |
 
 Commits that touch only `zcore/include/zcore/device/audio_input_backend.h`
 (not a ported routing file) are not listed. Numerical checks live in
