@@ -392,6 +392,12 @@ void framePlacementIsExact() {
     CHECK(!FramePositions(5, static_cast<long double>(INFINITY), 1).at(0));
     CHECK(!FramePositions(UINT64_MAX - 1, -0x1p64L, 1).at(0));
     CHECK(!FramePositions(0, 0x1p64L, 1).at(0));
+    // The limits are compared as integers. A 53-bit long double would round
+    // this room down and this anchor up: the last usable frame is still
+    // reached, and a frame before the first is still refused.
+    const auto top = FramePositions((uint64_t{1} << 63) - 3, 0x1p63L, 1).at(0);
+    CHECK(top && top->center == UINT64_MAX - 2 && top->fraction == 0);
+    CHECK(!FramePositions((uint64_t{1} << 63) + 2047, -0x1.0000000000001p63L, 1).at(0));
     std::printf("Frame placement exact on %llu dyadic and %llu reference frames; naive control "
                 "misplaces %llu\n",
                 4000ULL * 8, static_cast<unsigned long long>(compared),
