@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <zcore/device/audio_host_render.h>
+#include <zcore/device/audio_buffer.h>
 
 namespace singz {
 
@@ -85,6 +86,13 @@ struct AudioHostRateRange {
   double maximumHz{0.0};
 };
 
+// Candidate within both continuous device ranges and the monitoring budget.
+// Unknown/invalid ranges are refused. Discrete period restrictions (if any)
+// still require provider negotiation and checking the returned buffer size.
+std::optional<uint32_t> chooseMonitorBufferFrames(
+    const AudioHostBufferRange& inRange, const AudioHostBufferRange& outRange,
+    uint32_t target = 32, uint32_t maximum = 256) noexcept;
+
 struct AudioHostDeviceInfo {
   std::string uid;
   std::string label;
@@ -144,6 +152,16 @@ struct AudioHostConfig {
   // Never falls back silently: an exclusive request either opens exclusive
   // streams with the exact format or fails.
   bool exclusive{false};
+  // Optional negotiation ceiling, zero = no additional limit. A request whose
+  // achieved value exceeds this fails and attempts checked rollback. External
+  // changes may prevent rollback; still verify read-back and soft warnings.
+  // maximumFrames is callback capacity and must also fit the ORIGINAL shared
+  // device buffer, even if another in-process owner has already lowered it.
+  uint32_t maximumAcceptableBufferFrames{0};
+  // macOS requires explicit consent for requestedBufferFrames and live writes.
+  // The writer must own the stream in this process. Other-process property
+  // changes need not update an already-open provider's negotiated period.
+  bool allowSharedDeviceBufferChange{false};
 };
 
 struct AudioHostLatency {
@@ -230,6 +248,14 @@ struct AudioHostStatus {
   uint64_t invalidCallbacks{0};
   uint64_t renderFailures{0};
   AudioHostDiagnostics diagnostics{};
+  uint32_t bufferWarnings{AudioBufferWarningNone};
+  // An external device change exceeds prepared callback capacity. The macOS
+  // provider reports Error while this is true; no storage is resized on RT.
+  bool bufferExceedsMaximum{false};
+  // Diagnostic only; zero means no callback observed. The owner compares
+  // this with the negotiated period and decides whether to reopen a provider.
+  uint32_t observedCallbackFrames{0};
+
 };
 
 class AudioHostBackend {
@@ -261,6 +287,27 @@ class AudioHostBackend {
                                AudioHostRender render,
                                void* renderContext) = 0;
   virtual AudioHostResult start() = 0;
+  // Control-thread operation; never stops/reopens the stream. On macOS an
+  // opening allowSharedDeviceBufferChange opt-in is required. The
+  // nonzero request is clamped to the current device range, must fit the
+  // prepared maximumFrames, and is read back in result.latency.bufferFrames.
+  // A rounded read-back is accepted only within the range and every active
+  // owner's capacity/ceiling. An unsafe result triggers checked rollback.
+  // The device-wide property is shared with other apps. All in-process input
+  // and output leases defer restoration until the last closes, and restore
+  // only if the current value still matches our last write. Restoration is
+  // advisory (status.bufferWarnings), never a stop-time Error. The optional
+  // ceiling combines with the opening ceiling. Verify read-back and compare
+  // status().observedCallbackFrames before monitoring; the parent decides if
+  // a provider retaining its old callback size needs a reopen. ok acknowledges
+  // the property transaction, not callback-period adoption.
+  // This automatic opt-in policy differs from LoopZ's persistent user setting.
+  // Unsupported providers have no side effects.
+  virtual AudioHostResult setBufferFrames(std::uint32_t, std::uint32_t = 0) {
+    const auto current = status();
+    return {false, AudioHostError::Unsupported, current.state, current.format,
+            current.latency, "This audio host cannot change a live buffer size"};
+  }
   virtual void stop() noexcept = 0;
   virtual AudioHostStatus status() const noexcept = 0;
   // Hold a Running stream without closing it: no callbacks arrive while it is
@@ -289,8 +336,11 @@ class AudioHostBackend {
 // require a transient nonblocking PCM query-open (which can observe EBUSY);
 // other providers query their platform inventory without opening PCM streams.
 // Calls to open(), start(),
-// suspend(), resume(), stop(), and status() are serialized by the owner;
+// setBufferFrames(), suspend(), resume(), stop(), and status() are serialized by the owner;
 // status() may overlap only the audio callback's lock-free telemetry updates.
+// Run lifecycle and status on an ordinary control worker, never on a UI or
+// realtime-sensitive thread: macOS status locks against control transactions,
+// and device-ledger transactions hold their mutex across blocking HAL calls.
 class AudioHost final {
  public:
   AudioHost();
@@ -307,6 +357,8 @@ class AudioHost final {
   AudioHostResult open(const AudioHostConfig& config, AudioHostRender render,
                        void* renderContext);
   AudioHostResult start();
+  AudioHostResult setBufferFrames(std::uint32_t frames,
+                                  std::uint32_t maximumAcceptableBufferFrames = 0);
   AudioHostResult suspend();
   AudioHostResult resume();
   void stop() noexcept;

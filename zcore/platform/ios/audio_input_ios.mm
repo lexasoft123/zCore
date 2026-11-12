@@ -75,6 +75,9 @@ class IosAudioInputBackend final : public AudioInputBackend {
                         void* context) override {
     @autoreleasepool {
       stop();
+      if (config.requestedBufferFrames != 0 || config.maximumAcceptableBufferFrames != 0)
+        return AudioInputResult::failure(AudioInputState::Unsupported,
+            "Input buffer-size requests are unsupported on this platform", config.channel);
       channel_ = config.channel;
       selectedUid_ = config.deviceUid;
       if (!push || !context)

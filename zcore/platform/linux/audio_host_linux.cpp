@@ -29,6 +29,9 @@ class AlsaHost final : public AudioHostBackend {
   AudioHostResult open(const AudioHostConfig& config, AudioHostRender render,
                        void* context) override {
     stop();
+    if (config.maximumAcceptableBufferFrames != 0)
+      return {false, AudioHostError::Unsupported, AudioHostState::Unsupported, {}, {},
+              "Buffer negotiation ceilings are unsupported on this platform"};
     state_.store(AudioHostState::Closed, std::memory_order_release);
     const bool input = !config.inputChannels.empty();
     const double rate = config.requestedSampleRate ? config.requestedSampleRate : 48000;

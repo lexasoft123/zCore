@@ -269,6 +269,9 @@ class WasapiAudioInputBackend final : public AudioInputBackend {
   AudioInputResult open(const AudioInputConfig& config, AudioInputPush push,
                         void* context) override {
     stop();
+    if (config.requestedBufferFrames != 0 || config.maximumAcceptableBufferFrames != 0)
+      return AudioInputResult::failure(AudioInputState::Unsupported,
+          "Input buffer-size requests are unsupported on this platform", config.channel);
     if (!endpointIdFromUid(config.deviceUid, endpointId_))
       return failureResult("WASAPI device UID is invalid", config.channel);
     channel_ = config.channel;

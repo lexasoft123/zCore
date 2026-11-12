@@ -177,6 +177,7 @@ struct SINGZ_ZCORE_IMPL_LOCAL AudioInput::Impl {
   std::atomic<uint64_t> deliveredFrames{0};
   std::atomic<uint64_t> lastOverruns{0};
   std::atomic<uint64_t> deliveryWakeups{0};
+  std::atomic<uint32_t> bufferWarnings{AudioBufferWarningNone};
   double sampleRate = 0;
   AudioInputConfig config;
   std::string failure;
@@ -204,6 +205,7 @@ struct SINGZ_ZCORE_IMPL_LOCAL AudioInput::Impl {
       if (retainPrepared.load(std::memory_order_acquire) && backend->suspendPrepared()) return;
       retainPrepared.store(false,std::memory_order_release);
       backend->stop();
+      bufferWarnings.fetch_or(backend->bufferWarnings(), std::memory_order_relaxed);
     }
   }
 
@@ -230,6 +232,7 @@ struct SINGZ_ZCORE_IMPL_LOCAL AudioInput::Impl {
     {
       std::lock_guard<std::mutex> lock(backendControl);
       result = backend->start();
+      bufferWarnings.fetch_or(backend->bufferWarnings(), std::memory_order_relaxed);
     }
     if (!result.ok) {
       fail(result.error.empty() ? "audio input could not start" : result.error);
@@ -320,6 +323,9 @@ AudioInputResult AudioInput::start(const AudioInputConfig& config, AudioInputSin
   std::lock_guard<std::mutex> lifecycle(impl_->lifecycle);
   const bool samePrepared = impl_->retainPrepared.load(std::memory_order_acquire) && impl_->backend &&
       impl_->config.deviceUid == config.deviceUid && impl_->config.channel == config.channel &&
+      impl_->config.requestedBufferFrames == config.requestedBufferFrames &&
+      impl_->config.allowSharedDeviceBufferChange == config.allowSharedDeviceBufferChange &&
+      impl_->config.maximumAcceptableBufferFrames == config.maximumAcceptableBufferFrames &&
       impl_->config.ringBlocks == config.ringBlocks && impl_->state.load(std::memory_order_acquire) == AudioInputState::Stopped;
   // A retained sink-triggered stop cannot self-join; reap that finished
   // delivery object before assigning the next thread (even if it has exited).
@@ -339,6 +345,7 @@ AudioInputResult AudioInput::start(const AudioInputConfig& config, AudioInputSin
       impl_->deliveredFrames.store(0,std::memory_order_relaxed);
       impl_->lastOverruns.store(0,std::memory_order_relaxed);
       impl_->deliveryWakeups.store(0,std::memory_order_relaxed);
+      impl_->bufferWarnings.store(AudioBufferWarningNone,std::memory_order_relaxed);
       impl_->resetDeliveryWake();
       impl_->retainPrepared.store(false,std::memory_order_release);
       const auto started = impl_->activatePrepared();
@@ -379,6 +386,7 @@ AudioInputResult AudioInput::start(const AudioInputConfig& config, AudioInputSin
   impl_->deliveredFrames.store(0, std::memory_order_relaxed);
   impl_->lastOverruns.store(0, std::memory_order_relaxed);
   impl_->deliveryWakeups.store(0, std::memory_order_relaxed);
+  impl_->bufferWarnings.store(AudioBufferWarningNone, std::memory_order_relaxed);
   impl_->resetDeliveryWake();
   {
     std::lock_guard<std::mutex> control(impl_->control);
@@ -425,6 +433,7 @@ AudioInputResult AudioInput::start(const AudioInputConfig& config, AudioInputSin
     std::lock_guard<std::mutex> backend(impl_->backendControl);
     result = impl_->backend->open(config, AudioInputCallbackEndpoint::push,
                                   &impl_->callback);
+    impl_->bufferWarnings.fetch_or(impl_->backend->bufferWarnings(), std::memory_order_relaxed);
   }
   if (!result.ok) {
     impl_->stopBackend();
@@ -536,6 +545,7 @@ AudioInputStats AudioInput::stats() const {
   stats.overruns = impl_->ring ? impl_->ring->overruns()
                               : impl_->lastOverruns.load(std::memory_order_relaxed);
   stats.deliveryWakeups = impl_->deliveryWakeups.load(std::memory_order_relaxed);
+  stats.bufferWarnings = impl_->bufferWarnings.load(std::memory_order_relaxed);
   return stats;
 }
 

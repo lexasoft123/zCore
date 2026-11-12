@@ -11,6 +11,22 @@
 
 namespace singz::detail {
 
+inline constexpr uint32_t kMacAudioHostAliveChanged = 1u << 0;
+inline constexpr uint32_t kMacAudioHostFormatChanged = 1u << 1;
+inline constexpr uint32_t kMacAudioHostBufferChanged = 1u << 2;
+
+// Buffer-size notifications, including our own writes, are advisory. Only
+// alive/rate/stream-configuration notifications invalidate a running route.
+constexpr uint32_t macAudioHostControlChange(bool alive, bool rate,
+                                            bool streamConfiguration) noexcept {
+  return alive ? kMacAudioHostAliveChanged
+               : (rate || streamConfiguration ? kMacAudioHostFormatChanged : 0u);
+}
+
+constexpr bool macAudioHostBufferExceedsMaximum(uint32_t frames, uint32_t maximum) noexcept {
+  return frames > maximum;
+}
+
 // The AUHAL render callback uses this exact predicate before its only
 // AudioUnitRender call. Keeping it trivial and testable makes the output-only
 // no-input-pull invariant explicit without introducing a callback indirection.

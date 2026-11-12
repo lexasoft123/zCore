@@ -60,6 +60,8 @@ class AudioInputBackend {
   virtual bool suspendPrepared() { return false; }
   // Lock-free backend flags are rendered into a message here, off RT.
   virtual bool takeFailure(std::string& error) = 0;
+  // Control-domain advisory stop outcomes, independently of capture failures.
+  virtual uint32_t bufferWarnings() const noexcept { return AudioBufferWarningNone; }
 };
 
 std::unique_ptr<AudioInputBackend> createPlatformAudioInputBackend();

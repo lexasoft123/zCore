@@ -1,12 +1,38 @@
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <atomic>
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <zcore/device/audio_buffer.h>
 
 namespace singz::detail {
+
+inline constexpr uint32_t kMacAudioInputMaximumFrames = 16384;
+struct MacAudioInputPreparation {
+  uint32_t frames;
+  uint32_t warnings;
+};
+inline MacAudioInputPreparation macAudioInputPreparation(
+    std::optional<uint32_t> reported, std::optional<uint32_t> deviceFrames = std::nullopt) {
+  const bool missing = !reported || *reported == 0;
+  const uint32_t slice = missing ? 4096 : *reported;
+  if (slice > kMacAudioInputMaximumFrames) return {0, AudioBufferWarningNone};
+  return {std::min(kMacAudioInputMaximumFrames, std::max(slice, deviceFrames.value_or(0))),
+          missing ? AudioBufferWarningReadFailed : AudioBufferWarningNone};
+}
+
+// Retained resources keep their ledger lease until a real close. Merely
+// owning a lease (including an unchanged device) must not disable fast re-arm.
+template <class Stop>
+bool suspendMacAudioInputPrepared(bool prepared, bool& started, Stop stop) {
+  if (!prepared) return false;
+  if (started && !stop()) return false;
+  started = false;
+  return true;
+}
 
 inline constexpr uint32_t kMacInputLatencyChanged = 1u << 3;
 

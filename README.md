@@ -76,6 +76,77 @@ Optional components are controlled independently:
 | `ZCORE_BUILD_ANALYSIS` | `OFF` | Live-input analysis adapters |
 | `ZCORE_BUILD_TESTS` | `OFF` | Reusable CTest suites |
 | `ZCORE_BUILD_BENCHMARKS` | `OFF` | DSP benchmark executables |
+| `ZCORE_BUILD_TOOLS` | `OFF` | Opt-in, muted device buffer probe |
+
+On macOS, `AudioInputConfig::requestedBufferFrames` requests an input device I/O
+buffer size (zero leaves it unchanged). A nonzero request requires the explicit
+`AudioInputConfig::allowSharedDeviceBufferChange = true` opt-in; its default is
+false, and an unapproved request returns `Unsupported` before device resolution.
+The host also requires `AudioHostConfig::allowSharedDeviceBufferChange = true`
+for nonzero opening requests and live writes.
+`AudioHost::setBufferFrames(uint32_t, uint32_t maximumAcceptableBufferFrames = 0)`
+changes an open or running output without stopping or reopening it. Both clamp
+to the current device range and report the read-back size in
+`AudioInputResult::inputBufferFrames` or `AudioHostResult::latency.bufferFrames`.
+Input latency continues to exclude the I/O buffer. These CoreAudio settings are
+device-wide and shared with other apps. A shared process-wide ledger retains the
+original until the last input/output lease closes and restores only while the
+current value still matches this process's last write. Stop-time restore failures
+and external changes are soft `bufferWarnings` in host status or input stats.
+An ordinary input stop releases its lease; an explicit retained-prepared stop
+keeps the stopped unit and lease for fast re-arm until a real close. This opt-in per-lifetime policy differs from LoopZ's
+explicit persistent per-device setting.
+
+Input and host configs accept `maximumAcceptableBufferFrames` (zero = no extra
+limit). The host live setter accepts an additional ceiling, combined with its
+opening limit. Use 256 for monitoring: a device minimum above this is rejected
+before writing. Rounded read-backs are accepted within the device range and
+every active capacity/ceiling; unsafe observations trigger checked rollback using
+the immediate observed value as the expected value.
+Callers must still verify the reported size. Host `maximumFrames` is callback
+capacity: it must fit the original device buffer even if another lease already
+lowered the current size. Raising a live buffer beyond any active prepared
+capacity or opening ceiling is rejected. External changes publish
+`AudioHostStatus::bufferExceedsMaximum` and `Error` if they exceed callback
+capacity; `status()` reads a synchronized snapshot and performs no HAL query.
+
+A shared property change does not prove that an already-open provider adopted
+the period. `observedCallbackFrames` is a plain diagnostic published by one
+bounded lock-free callback store. The parent compares it with the negotiated
+buffer and chooses its own timeout or controlled reopen. No automatic
+verification state or reopen is maintained here. `format.nominalBufferFrames`
+and `latency.bufferFrames` retain the device property's negotiated size.
+Call lifecycle and status methods from an ordinary control worker. Status takes
+the control mutex and can wait behind blocking HAL transactions; do not call it
+from a UI or realtime-sensitive thread. Ordinary input capture sizes its render
+storage from the larger of the reported slice (or 4096-frame fallback with a
+warning) and current device buffer, capped at 16384 frames. No AUHAL capacity
+is forced. Unchanged capture holds a capacity-only lease and can open when the
+device property exceeds that cap; an oversized callback is dropped safely and
+reported as a capture failure. A 4096-frame mono render plane uses 16 KiB,
+with the existing hard limit bounding it at 64 KiB.
+The writer must be the process that owns the stream. LoopZ observed a 32-frame
+setter in one process while another still read/used 512, and deliberately reopens
+its monitor streams after hardware-buffer settings changes.
+Non-macOS input buffer requests, negotiation ceilings and live output changes
+report `Unsupported`; callers should set these options only on macOS.
+
+`chooseMonitorBufferFrames(inRange, outRange, target = 32, maximum = 256)` returns
+a candidate in both reported `AudioHostBufferRange` bounds, or `nullopt` when
+the ranges are unknown, disjoint, or exceed the budget. Discrete period
+restrictions still require provider negotiation; check the reported size before
+enabling monitoring.
+
+Build with `-DZCORE_BUILD_TOOLS=ON`, then explicitly run
+`zcore_audio_host_buffer_probe --live-buffer 256 32` to try the default output.
+It renders only silence, opens at the first requested size, changes live to the
+second, and prints negotiated sizes, callback progress, route/stream generations,
+xruns, deadline misses, discontinuities, invalid callbacks, actual callback size,
+negotiated/observed comparison and stop warnings. These are host
+telemetry counters, not an acoustic glitch measurement. Hardware testing with
+song playback and loopback measurement remains a consumer integration check;
+unit tests cover property negotiation/rollback and fake backends, while macOS
+integration is compile-checked.
 
 ## Add to your project
 
