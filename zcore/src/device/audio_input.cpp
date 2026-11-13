@@ -438,6 +438,7 @@ AudioInputResult AudioInput::start(const AudioInputConfig& config, AudioInputSin
     result = impl_->backend->open(config, AudioInputCallbackEndpoint::push,
                                   &impl_->callback);
     impl_->bufferWarnings.fetch_or(impl_->backend->bufferWarnings(), std::memory_order_relaxed);
+    impl_->backend->setPositionPush(AudioInputCallbackEndpoint::pushWithPosition);
   }
   if (!result.ok) {
     impl_->stopBackend();

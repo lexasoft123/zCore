@@ -5,6 +5,16 @@
 #include <memory>
 
 namespace zcore::routing {
+// Prepared on control; zero disables unverified timestamp-phase tolerance.
+// The effective sample bound is min(maximumStepSamples, nominalRate * 0.0001).
+// A rolling one-second budget prevents a persistently wrong clock being hidden.
+struct SampleClockPhaseConfig {
+    double maximumStepSamples{2};
+    uint32_t maximumCorrectionsPerSecond{8};
+};
+struct SampleClockPhaseDiagnostics {
+    uint64_t phaseCorrections{}, correctedSamples{}, rejectedIntervals{};
+};
 struct SampleClockMapping {
     bool valid{false};
     uint64_t frame{0};
@@ -23,9 +33,13 @@ class SampleClockHistory {
         uint64_t begin{0}, end{0};
     };
     explicit SampleClockHistory(uint32_t capacity);
+    SampleClockHistory(uint32_t capacity, SampleClockPhaseConfig phaseConfig);
+    SampleClockPhaseDiagnostics phaseDiagnostics() const noexcept;
     ~SampleClockHistory();
     SampleClockHistory(const SampleClockHistory&) = delete;
     SampleClockHistory& operator=(const SampleClockHistory&) = delete;
+    // Small unverified phase steps use the prepared phaseConfig's bounded closed
+    // interval slope; they never change PCM storage or extrapolate that slope.
     // Set only when an authoritative source sample counter proves contiguous
     // frames since the preceding anchor. It is not inferred from receipt time.
     // Valid rates permit only those continuous intervals to replace an otherwise

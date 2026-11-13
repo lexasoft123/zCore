@@ -221,6 +221,8 @@ class MacAudioInputBackend final : public AudioInputBackend {
  public:
   ~MacAudioInputBackend() override { stop(); }
 
+  void setPositionPush(AudioInputPositionPush push) override { positionPush_ = push; }
+
   AudioInputResult open(const AudioInputConfig& config, AudioInputPush push,
                         void* context) override {
     stop();
@@ -516,6 +518,7 @@ class MacAudioInputBackend final : public AudioInputBackend {
     initialized_ = false;
     renderBuffer_.clear();
     push_ = nullptr;
+    positionPush_ = nullptr;
     context_ = nullptr;
     if (bufferOwnership_.token == 0) selectedDevice_ = kAudioObjectUnknown;
     selectedStream_ = kAudioObjectUnknown;
@@ -657,11 +660,22 @@ class MacAudioInputBackend final : public AudioInputBackend {
         : 0;
     const AudioInputTimestampProjection projected = resolveAudioInputTimestamp(
         hardwareValid, hardwareNs, callbackNs, frames, self->sampleRate_);
-    self->push_(self->context_, self->renderBuffer_.data(), frames,
-                projected.sampleHostTimeNs, callbackNs,
-                projected.usedHardwareAnchor
-                    ? AudioInputTimestampQuality::Hardware
-                    : AudioInputTimestampQuality::CallbackEstimate);
+    if (self->positionPush_) {
+      self->positionPush_(self->context_, self->renderBuffer_.data(), frames,
+                          projected.sampleHostTimeNs, callbackNs,
+                          projected.usedHardwareAnchor
+                              ? AudioInputTimestampQuality::Hardware
+                              : AudioInputTimestampQuality::CallbackEstimate,
+                          resolveAudioInputSourcePosition(
+                              timestamp && (timestamp->mFlags & kAudioTimeStampSampleTimeValid),
+                              timestamp ? timestamp->mSampleTime : 0));
+    } else {
+      self->push_(self->context_, self->renderBuffer_.data(), frames,
+                  projected.sampleHostTimeNs, callbackNs,
+                  projected.usedHardwareAnchor
+                      ? AudioInputTimestampQuality::Hardware
+                      : AudioInputTimestampQuality::CallbackEstimate);
+    }
     return noErr;
   }
 
@@ -691,6 +705,7 @@ class MacAudioInputBackend final : public AudioInputBackend {
   std::vector<float> renderBuffer_;
   uint32_t renderMaximumFrames_ = 0;
   AudioInputPush push_ = nullptr;
+  AudioInputPositionPush positionPush_ = nullptr;
   void* context_ = nullptr;
   std::atomic<int32_t> callbackFailure_{0};
   detail::MacInputRenderRecovery renderRecovery_;

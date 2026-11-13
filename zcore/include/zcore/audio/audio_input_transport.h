@@ -31,6 +31,9 @@ struct AudioInputBlockView {
   double sampleRate = 0;
   const float* mono = nullptr;
   uint32_t frames = 0;
+  // Additive hardware sample position, independent of capture.sourceFrame.
+  // sampleHostTimeNs and capture metadata retain their original semantics.
+  AudioInputSourcePosition sourcePosition{};
 };
 
 // Preallocated SPSC transport. Platform callbacks receive producer(); the

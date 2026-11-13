@@ -72,8 +72,9 @@ struct AudioHistory::Impl {
     double previousRate{0}, previousSource{0};
     uint32_t previousFrames{0};
     bool previousSourceValid{false};
-    Impl(uint32_t count, uint32_t frames, ResamplingFilter filter, bool readDiagnostics)
-        : channels(count), capacity(frames), resampler(filter), filter(filter), clock(frames + 1),
+    Impl(uint32_t count, uint32_t frames, ResamplingFilter filter, bool readDiagnostics,
+         SampleClockPhaseConfig phaseConfig)
+        : channels(count), capacity(frames), resampler(filter), filter(filter), clock(frames + 1, phaseConfig),
           tags(std::make_unique<FrameTag[]>(frames)),
           samples(std::make_unique<std::atomic<uint32_t>[]>(static_cast<size_t>(count) * frames)),
           diagnostics(readDiagnostics ? std::make_unique<ReadDiagnostics>() : nullptr) {}
@@ -116,11 +117,14 @@ struct AudioHistory::Impl {
 AudioHistory::AudioHistory(uint32_t channels, uint32_t capacityFrames)
     : AudioHistory(channels, capacityFrames, ResamplingFilter::LinearPhase) {}
 AudioHistory::AudioHistory(uint32_t channels, uint32_t capacityFrames, ResamplingFilter filter,
-                           bool readDiagnostics) {
+                           bool readDiagnostics)
+    : AudioHistory(channels, capacityFrames, filter, readDiagnostics, {}) {}
+AudioHistory::AudioHistory(uint32_t channels, uint32_t capacityFrames, ResamplingFilter filter,
+                           bool readDiagnostics, SampleClockPhaseConfig phaseConfig) {
     if (!channels || channels > kMaximumRoutingChannels || capacityFrames < kBlock * 2 ||
         capacityFrames > kCapacity)
         throw std::invalid_argument("Invalid audio history capacity");
-    impl_ = std::make_unique<Impl>(channels, capacityFrames, filter, readDiagnostics);
+    impl_ = std::make_unique<Impl>(channels, capacityFrames, filter, readDiagnostics, phaseConfig);
 }
 AudioHistory::~AudioHistory() = default;
 uint32_t AudioHistory::channels() const noexcept {
@@ -260,9 +264,11 @@ void AudioHistory::stop() noexcept {
 }
 AudioHistoryStatus AudioHistory::status() const noexcept {
     const auto& self = *impl_;
+    const auto phase = self.clock.phaseDiagnostics();
     return {self.online.load(),          self.available.load(),
             self.anchorNs.load(),        self.callbacks.load(),
-            self.discontinuities.load(), std::bit_cast<double>(self.rateBits.load())};
+            self.discontinuities.load(), std::bit_cast<double>(self.rateBits.load()),
+            phase.phaseCorrections, phase.correctedSamples, phase.rejectedIntervals};
 }
 uint64_t AudioHistory::publishedBlockEndHostNs() const noexcept {
     const auto& self = *impl_;
@@ -283,6 +289,10 @@ AudioHistoryReadSnapshot AudioHistory::readDiagnostics() const noexcept {
         return {};
     AudioHistoryReadSnapshot result;
     result.enabled = true;
+    const auto phase = impl_->clock.phaseDiagnostics();
+    result.phaseCorrections = phase.phaseCorrections;
+    result.correctedSamples = phase.correctedSamples;
+    result.rejectedIntervals = phase.rejectedIntervals;
     result.reads = counters->reads.load(std::memory_order_relaxed);
     result.requestedFrames = counters->requestedFrames.load(std::memory_order_relaxed);
     for (size_t index = 0; index < result.resampleBlockCounts.size(); ++index)

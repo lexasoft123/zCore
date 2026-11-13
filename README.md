@@ -251,3 +251,82 @@ A project-wide license has not yet been declared. Bundled third-party components
 retain their own license notices, including
 [libFLAC](third_party/native/flac/COPYING.Xiph) and
 [dr_mp3](third_party/native/dr_mp3/dr_mp3.h).
+
+## Capture timestamp phase tolerance
+
+`SampleClockPhaseConfig` configures `SampleClockHistory(capacity, config)` or
+`AudioHistory(channels, capacity, filter, readDiagnostics, config)` on control.
+`maximumStepSamples` defaults to 2 (valid range 0..16); the effective bound is
+also capped at 0.1 ms at the nominal rate. `maximumCorrectionsPerSecond`
+defaults to 8 (range 0..64), in a rolling one-second window. Zero for either
+field disables unverified phase tolerance. Invalid configurations throw at
+construction. Neither setting changes the existing sample-counter-verified
+correction policy described in `audio_history.h`.
+
+A small host-time phase step which would fail the ordinary ±0.5% interval-rate
+check now re-anchors the resampler phase over that closed callback interval.
+It retains the raw timestamp endpoint and uses a fractional slope: at most the
+configured sample displacement across the interval, additionally limited to
+0.8..1.25 of nominal rate. No stored PCM frames are removed, inserted or copied.
+The corrected slope is never extrapolated into the next open interval. A
+persistent one-sample step therefore consumes one correction, without silently
+shifting the queue or altering host timestamps. Larger/unbudgeted intervals
+retain the existing missing-audio behavior; >2 ms jumps and hardware sample
+counter gaps retain the generation-reset path. Timestamp quantization has a
+2 ns comparison allowance. The rolling budget survives a history reset.
+
+`AudioHistoryStatus` and the opt-in `AudioHistoryReadSnapshot` append
+`phaseCorrections`, `correctedSamples`, and `rejectedIntervals`.
+`SampleClockHistory::phaseDiagnostics()` returns the same producer counters.
+`phaseCorrections` counts accepted unverified phase intervals;
+`correctedSamples` sums the absolute displacement rounded up in samples (after
+the 2 ns quantization allowance); `rejectedIntervals` counts closed intervals
+which still cannot be mapped, once per publication, rather than per reader or
+missing output frame. These cumulative counters survive stop/reset/reopen on
+the same history object. The existing `verifiedClockSteps` diagnostics continue
+to describe the separate authoritative-counter correction path. Status counters
+are available even when optional read diagnostics are disabled.
+
+macOS `AudioInput` now delivers `AudioInputBlockView::sourcePosition`, an
+`AudioInputSourcePosition { double sampleFrame; bool valid; }` copied from the
+AUHAL `mSampleTime` when its validity flag is set and the value is finite.
+Negative hardware positions are valid. This is independent of the transport's
+`capture.sourceFrame` counter, which counts *offered* PCM and cannot prove
+hardware continuity. Feed `sourcePosition.sampleFrame` and `.valid` to the
+existing `AudioHistory::append` source-frame arguments; a counter gap takes
+precedence over timestamp tolerance. Missing sample-time validity stays false;
+no callback-derived counter is promoted to hardware evidence. The additive
+`AudioInputBackend::setPositionPush(AudioInputPositionPush)` extension installs
+an optional replacement push before start; unsupported backends and existing
+`AudioInputPush` callbacks retain their original behavior. Both push paths keep
+all host timestamps, timestamp quality, capture metadata, sequence and PCM
+identical, including silence supplied after tolerated AUHAL render failures.
+Take gap-padding consumers continue to use the original hardware host times.
+
+ABI layout (64-bit macOS, bytes): `AudioInputSourcePosition` is 16 bytes;
+`AudioInputBlockView` grows 112 -> 128, appending `sourcePosition` at offset 112;
+`AudioHistoryStatus` grows 40 -> 64 and `AudioHistoryReadSnapshot` grows
+152 -> 176. Their counters start at offsets 40 and 152 respectively and are
+three uint64 values in the order above. `SampleClockPhaseConfig` is 16 bytes and
+`SampleClockPhaseDiagnostics` is 24 bytes.
+Existing field offsets and legacy function signatures are unchanged; the
+original constructor symbols remain. This static C++ library requires consumers
+to rebuild when exchanging extended structs or subclassing `AudioInputBackend`
+(whose optional virtual is appended); mixed old/new binary layouts are not safe.
+
+Portable `zcore_routing_phase_tolerance_tests` reproduces the original 33/65/129
+missing-frame holes at periods 32/64/128 with a 1024-frame queue and tolerance
+disabled, then verifies 0/0/0 with tolerance enabled, both step signs, zero
+resets, bounded output displacement, a 64-sample rejection, absolute time bound,
+rolling budget and hardware-counter gaps. Two compiled production-code mutants
+must fail with their own messages when tolerance or the sample bound is removed.
+`zcore_audio_input_position_tests` verifies the real facade delivery extension,
+negative hardware positions, reused-ring-slot validity and identical
+legacy timestamp/PCM/metadata values for gap-padding consumers.
+
+For an application take-writer regression, optionally configure with
+`-DZCORE_CAPTURE_TAKE_WRITER_SOURCE=/path/to/consumer/native/electron/take_writer.cpp`.
+`zcore_capture_take_compatibility_tests` feeds legacy and hardware-position
+capture blocks into that actual writer and requires identical WAV bytes,
+including a 512-frame host-time gap with a continuous sample counter. The
+standalone package has no default dependency on a consumer implementation.

@@ -16,6 +16,7 @@ struct AudioInputRingSlot {
   AudioInputTimestampQuality timestampQuality =
       AudioInputTimestampQuality::Unknown;
   AudioInputCaptureMetadata capture;
+  AudioInputSourcePosition sourcePosition{};
 };
 
 // Raw, prebound view used by the producer. Ownership and counter widening stay

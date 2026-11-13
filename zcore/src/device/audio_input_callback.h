@@ -31,6 +31,11 @@ class SINGZ_ZCORE_CALLBACK_LOCAL AudioInputCallbackEndpoint {
                    uint64_t sampleHostTimeNs, uint64_t callbackHostTimeNs,
                    AudioInputTimestampQuality timestampQuality) noexcept;
 
+  static bool pushWithPosition(void* context, const float* mono, uint32_t frames,
+                   uint64_t sampleHostTimeNs, uint64_t callbackHostTimeNs,
+                   AudioInputTimestampQuality timestampQuality,
+                   AudioInputSourcePosition sourcePosition) noexcept;
+
  private:
   static_assert(std::atomic<bool>::is_always_lock_free,
                 "audio callback notification requires lock-free bool atomics");

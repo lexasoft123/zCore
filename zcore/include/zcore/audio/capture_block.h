@@ -33,6 +33,14 @@ enum AudioInputCaptureFlags : uint32_t {
   AudioInputDiscontinuous = 1u << 5,
 };
 
+// Optional hardware position, separate from the transport's offered-frame
+// counter. Negative AUHAL positions are valid; invalid/missing positions must
+// never be promoted to authoritative continuity using callback counts.
+struct AudioInputSourcePosition {
+  double sampleFrame = 0;
+  bool valid = false;
+};
+
 // Copyable capture provenance stored beside PCM in the preallocated ring.
 // It contains device truth only: output-route latency is never projected into
 // these timestamps.
