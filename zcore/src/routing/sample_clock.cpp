@@ -62,17 +62,20 @@ struct SampleClockHistory::Impl {
     std::atomic<uint64_t> phaseCorrections{0}, correctedSamples{0}, rejectedIntervals{0};
     Impl(uint32_t count, SampleClockPhaseConfig config)
         : capacity(count), records(std::make_unique<Record[]>(count)), phaseConfig(config) {}
-    bool admitPhaseCorrection(uint64_t ns) noexcept {
+    bool canCorrectPhase(uint64_t ns) const noexcept {
         const auto limit = phaseConfig.maximumCorrectionsPerSecond;
         if (!limit) return false;
         if (correctionCount == limit &&
             (ns < correctionTimes[correctionNext] ||
              ns - correctionTimes[correctionNext] < 1000000000ULL))
             return false;
+        return true;
+    }
+    void commitPhaseCorrection(uint64_t ns) noexcept {
+        const auto limit = phaseConfig.maximumCorrectionsPerSecond;
         correctionTimes[correctionNext] = ns;
         correctionNext = (correctionNext + 1) % limit;
         correctionCount = std::min(correctionCount + 1, limit);
-        return true;
     }
     bool read(uint64_t ticket, Anchor& result) const noexcept {
         if (ticket == UINT64_MAX)
@@ -105,6 +108,7 @@ bool SampleClockHistory::append(uint64_t frame, uint64_t hostNs,
         return false;
     auto mappedNs = hostNs;
     bool phaseCorrected = false;
+    uint64_t correctedSamples = 0;
     if (ticket > self.begin.load()) {
         Anchor previous;
         if (!self.read(ticket - 1, previous) || frame <= previous.frame ||
@@ -131,11 +135,10 @@ bool SampleClockHistory::append(uint64_t frame, uint64_t hostNs,
                                    (hostNs - previous.ns);
             if (bound > 0 && errorSamples <= bound + 2e-9 * nominalRate &&
                 localRate >= nominalRate * 0.8 && localRate <= nominalRate * 1.25 &&
-                self.admitPhaseCorrection(hostNs)) {
+                self.canCorrectPhase(hostNs)) {
                 phaseCorrected = true;
-                self.phaseCorrections.fetch_add(1, std::memory_order_relaxed);
-                self.correctedSamples.fetch_add(static_cast<uint64_t>(std::max(1.0L,
-                    std::ceil(errorSamples - 2e-9L * nominalRate))), std::memory_order_relaxed);
+                correctedSamples = static_cast<uint64_t>(std::max(1.0L,
+                    std::ceil(errorSamples - 2e-9L * nominalRate)));
             }
         }
         if (contiguousSourceFrames && nominalValid &&
@@ -162,8 +165,10 @@ bool SampleClockHistory::append(uint64_t frame, uint64_t hostNs,
         if (mappedNs <= previous.ns)
             return false;
         if (nominalValid && !intervalRate(previous,
-                {frame, mappedNs, hostNs, contiguousSourceFrames, phaseCorrected}, nominalRate))
+                {frame, mappedNs, hostNs, contiguousSourceFrames, phaseCorrected}, nominalRate)) {
+            phaseCorrected = false;
             self.rejectedIntervals.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     auto& record = self.records[ticket % self.capacity];
     record.stamp.store(0);
@@ -174,6 +179,13 @@ bool SampleClockHistory::append(uint64_t frame, uint64_t hostNs,
     record.phaseCorrected.store(phaseCorrected);
     record.stamp.store(ticket + 1);
     self.end.store(ticket + 1);
+    // Only a fully published, usable interval spends budget or counts as a
+    // correction. A failed append/rejected mapping must leave these untouched.
+    if (phaseCorrected) {
+        self.commitPhaseCorrection(hostNs);
+        self.phaseCorrections.fetch_add(1, std::memory_order_relaxed);
+        self.correctedSamples.fetch_add(correctedSamples, std::memory_order_relaxed);
+    }
     return true;
 }
 SampleClockPhaseDiagnostics SampleClockHistory::phaseDiagnostics() const noexcept {
@@ -191,6 +203,7 @@ uint64_t SampleClockHistory::lastHostNs() const noexcept {
 }
 void SampleClockHistory::reset() noexcept {
     impl_->correctionBlocked = false;
+    impl_->correctionCount = impl_->correctionNext = 0;
     impl_->begin.store(impl_->end.load());
 }
 SampleClockHistory::Snapshot SampleClockHistory::snapshot() const noexcept {

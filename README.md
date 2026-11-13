@@ -256,11 +256,12 @@ retain their own license notices, including
 
 `SampleClockPhaseConfig` configures `SampleClockHistory(capacity, config)` or
 `AudioHistory(channels, capacity, filter, readDiagnostics, config)` on control.
-`maximumStepSamples` defaults to 2 (valid range 0..16); the effective bound is
-also capped at 0.1 ms at the nominal rate. `maximumCorrectionsPerSecond`
-defaults to 8 (range 0..64), in a rolling one-second window. Zero for either
-field disables unverified phase tolerance. Invalid configurations throw at
-construction. Neither setting changes the existing sample-counter-verified
+Both fields default to zero, preserving legacy rejection for existing callers.
+Monitoring callers opt in explicitly, for example `SampleClockPhaseConfig{2, 8}`:
+`maximumStepSamples` accepts 0..16 and is also capped at 0.1 ms at the nominal
+rate; `maximumCorrectionsPerSecond` accepts 0..64 in a rolling one-second window.
+Zero for either field disables unverified phase tolerance. Invalid configurations
+throw at construction. Neither setting changes the existing sample-counter-verified
 correction policy described in `audio_history.h`.
 
 A small host-time phase step which would fail the ordinary ±0.5% interval-rate
@@ -273,12 +274,13 @@ persistent one-sample step therefore consumes one correction, without silently
 shifting the queue or altering host timestamps. Larger/unbudgeted intervals
 retain the existing missing-audio behavior; >2 ms jumps and hardware sample
 counter gaps retain the generation-reset path. Timestamp quantization has a
-2 ns comparison allowance. The rolling budget survives a history reset.
+2 ns comparison allowance. A history reset clears the rolling budget for the
+new continuity generation.
 
 `AudioHistoryStatus` and the opt-in `AudioHistoryReadSnapshot` append
 `phaseCorrections`, `correctedSamples`, and `rejectedIntervals`.
 `SampleClockHistory::phaseDiagnostics()` returns the same producer counters.
-`phaseCorrections` counts accepted unverified phase intervals;
+`phaseCorrections` counts fully published, usable unverified phase intervals;
 `correctedSamples` sums the absolute displacement rounded up in samples (after
 the 2 ns quantization allowance); `rejectedIntervals` counts closed intervals
 which still cannot be mapped, once per publication, rather than per reader or
@@ -318,7 +320,10 @@ Portable `zcore_routing_phase_tolerance_tests` reproduces the original 33/65/129
 missing-frame holes at periods 32/64/128 with a 1024-frame queue and tolerance
 disabled, then verifies 0/0/0 with tolerance enabled, both step signs, zero
 resets, bounded output displacement, a 64-sample rejection, absolute time bound,
-rolling budget and hardware-counter gaps. Two compiled production-code mutants
+rolling budget, reset replenishment, the 8 kHz time ceiling and hardware-counter
+gaps. A ten-minute fake-clock run injects 60 alternating one-sample phase steps
+and requires zero missing frames and exactly 60 applied corrections.
+Two compiled production-code mutants
 must fail with their own messages when tolerance or the sample bound is removed.
 `zcore_audio_input_position_tests` verifies the real facade delivery extension,
 negative hardware positions, reused-ring-slot validity and identical

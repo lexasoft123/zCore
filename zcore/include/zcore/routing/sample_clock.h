@@ -5,12 +5,13 @@
 #include <memory>
 
 namespace zcore::routing {
-// Prepared on control; zero disables unverified timestamp-phase tolerance.
+// Opt in on control (for example {2, 8}); default construction preserves
+// legacy unverified interval rejection. Zero disables phase tolerance.
 // The effective sample bound is min(maximumStepSamples, nominalRate * 0.0001).
 // A rolling one-second budget prevents a persistently wrong clock being hidden.
 struct SampleClockPhaseConfig {
-    double maximumStepSamples{2};
-    uint32_t maximumCorrectionsPerSecond{8};
+    double maximumStepSamples{0};
+    uint32_t maximumCorrectionsPerSecond{0};
 };
 struct SampleClockPhaseDiagnostics {
     uint64_t phaseCorrections{}, correctedSamples{}, rejectedIntervals{};
@@ -50,6 +51,8 @@ class SampleClockHistory {
                 double nominalRate = 0, double fallbackRate = 0) noexcept;
     // Effective timestamp of the newest anchor, including a verified correction.
     uint64_t lastHostNs() const noexcept;
+    // Starts a new continuity generation and clears its rolling correction budget.
+    // Cumulative diagnostic counters are retained.
     void reset() noexcept;
     Snapshot snapshot() const noexcept;
     // fractionNs retains sub-nanosecond output-grid positions. Only the newest
