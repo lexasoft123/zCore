@@ -115,6 +115,10 @@ struct AudioInputStats {
   uint64_t overruns = 0;
   uint64_t deliveryWakeups = 0;
   uint32_t bufferWarnings = AudioBufferWarningNone;
+  // macOS AUHAL slice-race blocks replaced by equal-length silence at their
+  // own timestamps; per take, retained after stop. Separate from ring overruns
+  // and consumer event/window drops; these blocks still advance deliveredFrames.
+  uint64_t renderSliceDrops = 0;
 };
 
 using AudioInputSink = std::function<void(const AudioInputBlockView&)>;

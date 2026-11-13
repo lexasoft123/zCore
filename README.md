@@ -133,6 +133,27 @@ After initialization, the lease reserves the smaller of storage and the
 confirmed unit slice. An unreadable unit limit reserves zero until close;
 restoration above a remaining reservation is refused softly. Ordinary capture
 still opens when this optional setting/readback fails.
+AUHAL updates its render slice asynchronously after device-buffer changes,
+including shrink-then-grow sequences that invalidate a pre-initialize preset.
+Input tolerates only `kAudioUnitErr_TooManyFramesToProcess` (-10874): that
+callback delivers an equal-length block of zeros at its own normal timestamps
+and returns success so a later callback can recover. The failed signal is
+discarded; silence preserves take duration, sequence and source-frame progress
+without presenting stale signal to pitch analysis.
+More than 64 consecutive such callbacks, or a failed callback at least 250 ms
+after the first in the burst, uses the existing fatal render-error path. A
+successful render resets the burst; every other render status remains fatal.
+`AudioInputStats::renderSliceDrops` counts these tolerated silence-replaced blocks per
+take, including after stop, separately from ring overruns and application event
+drops. The callback performs no unit property queries or repair transactions.
+Portable tests exercise this policy and accounting through a fake backend and
+the real input facade; actual AUHAL render/return behavior and sample continuity
+still require the Mac hardware checklist.
+Raw transport does not mark host-time jumps caused by missing callbacks with
+otherwise successful renders. Timestamp quality alone does not indicate this
+gap; recording consumers must compare successive sample host times and block
+durations. The analysis adapter's existing clock-reanchor detection resets
+analysis windows but does not insert missing time into a concatenating recorder.
 Unchanged input stream-configuration notifications are benign; input stream
 IDs, physical/virtual formats, rate and per-buffer channel layout are compared
 after one retry of a failed read. Buffer-only notifications remain advisory.

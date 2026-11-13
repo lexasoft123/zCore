@@ -62,6 +62,9 @@ class AudioInputBackend {
   virtual bool takeFailure(std::string& error) = 0;
   // Control-domain advisory stop outcomes, independently of capture failures.
   virtual uint32_t bufferWarnings() const noexcept { return AudioBufferWarningNone; }
+  // Cumulative for the current take, atomically readable from the control domain.
+  // start() resets this before callbacks begin; stop() preserves the final value.
+  virtual uint64_t renderSliceDrops() const noexcept { return 0; }
 };
 
 std::unique_ptr<AudioInputBackend> createPlatformAudioInputBackend();

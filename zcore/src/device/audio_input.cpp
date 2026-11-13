@@ -177,6 +177,7 @@ struct SINGZ_ZCORE_IMPL_LOCAL AudioInput::Impl {
   std::atomic<uint64_t> deliveredFrames{0};
   std::atomic<uint64_t> lastOverruns{0};
   std::atomic<uint64_t> deliveryWakeups{0};
+  std::atomic<uint64_t> lastRenderSliceDrops{0};
   std::atomic<uint32_t> bufferWarnings{AudioBufferWarningNone};
   double sampleRate = 0;
   AudioInputConfig config;
@@ -205,6 +206,7 @@ struct SINGZ_ZCORE_IMPL_LOCAL AudioInput::Impl {
       if (retainPrepared.load(std::memory_order_acquire) && backend->suspendPrepared()) return;
       retainPrepared.store(false,std::memory_order_release);
       backend->stop();
+      lastRenderSliceDrops.store(backend->renderSliceDrops(), std::memory_order_relaxed);
       bufferWarnings.fetch_or(backend->bufferWarnings(), std::memory_order_relaxed);
     }
   }
@@ -345,6 +347,7 @@ AudioInputResult AudioInput::start(const AudioInputConfig& config, AudioInputSin
       impl_->deliveredFrames.store(0,std::memory_order_relaxed);
       impl_->lastOverruns.store(0,std::memory_order_relaxed);
       impl_->deliveryWakeups.store(0,std::memory_order_relaxed);
+      impl_->lastRenderSliceDrops.store(0,std::memory_order_relaxed);
       impl_->bufferWarnings.store(AudioBufferWarningNone,std::memory_order_relaxed);
       impl_->resetDeliveryWake();
       impl_->retainPrepared.store(false,std::memory_order_release);
@@ -386,6 +389,7 @@ AudioInputResult AudioInput::start(const AudioInputConfig& config, AudioInputSin
   impl_->deliveredFrames.store(0, std::memory_order_relaxed);
   impl_->lastOverruns.store(0, std::memory_order_relaxed);
   impl_->deliveryWakeups.store(0, std::memory_order_relaxed);
+  impl_->lastRenderSliceDrops.store(0, std::memory_order_relaxed);
   impl_->bufferWarnings.store(AudioBufferWarningNone, std::memory_order_relaxed);
   impl_->resetDeliveryWake();
   {
@@ -546,6 +550,8 @@ AudioInputStats AudioInput::stats() const {
                               : impl_->lastOverruns.load(std::memory_order_relaxed);
   stats.deliveryWakeups = impl_->deliveryWakeups.load(std::memory_order_relaxed);
   stats.bufferWarnings = impl_->bufferWarnings.load(std::memory_order_relaxed);
+  stats.renderSliceDrops = impl_->backend ? impl_->backend->renderSliceDrops()
+      : impl_->lastRenderSliceDrops.load(std::memory_order_relaxed);
   return stats;
 }
 

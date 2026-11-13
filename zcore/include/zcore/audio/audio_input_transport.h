@@ -14,6 +14,12 @@
 namespace singz {
 
 struct AudioInputBlockView {
+  // sourceFrame counts frames offered to the transport, including synthesized
+  // silence. macOS tolerated render-slice failures supply a normal block of
+  // equal-length silence at the failed callback's timestamps, preserving take
+  // duration, sequence and source-frame progress (see renderSliceDrops stats).
+  // Raw transport does not infer missing callbacks from host-time jumps;
+  // timestampQuality describes timestamp provenance, not sample continuity.
   AudioInputCaptureMetadata capture;
   // Compatibility aliases retained while existing delivery consumers move to
   // capture.*. New code must use the typed metadata object above.

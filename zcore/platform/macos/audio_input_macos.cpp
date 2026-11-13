@@ -26,11 +26,14 @@
 
 #include <zcore/audio/audio_input_timestamp.h>
 #include "audio_input_macos_latency.h"
+#include "audio_input_macos_render.h"
 #include "audio_device_macos_buffer.h"
 #include "audio_device_macos_buffer_properties.h"
 
 namespace singz {
 namespace {
+
+static_assert(kAudioUnitErr_TooManyFramesToProcess == detail::kMacInputTooManyFrames);
 
 static_assert(kAudioDevicePropertyDeviceIsAlive == detail::audioHostFourCc('l', 'i', 'v', 'n'));
 static_assert(kAudioDevicePropertyNominalSampleRate == detail::audioHostFourCc('n', 's', 'r', 't'));
@@ -457,6 +460,8 @@ class MacAudioInputBackend final : public AudioInputBackend {
     // delivered. A new map/format requires reopening rather than rebasing it.
     if (streamConfigurationChanged())
       return failMessage("audio input stream configuration changed; restart capture", channel_);
+    renderRecovery_ = {};
+    renderSliceDrops_.store(0, std::memory_order_relaxed);
     const OSStatus status = AudioOutputUnitStart(unit_);
     if (status != noErr) return fail("start AUHAL", status, channel_);
     started_ = true;
@@ -518,6 +523,9 @@ class MacAudioInputBackend final : public AudioInputBackend {
   }
 
   uint32_t bufferWarnings() const noexcept override { return bufferWarnings_; }
+  uint64_t renderSliceDrops() const noexcept override {
+    return renderSliceDrops_.load(std::memory_order_relaxed);
+  }
 
   bool takeFailure(std::string& error) override {
     const uint32_t changes = listenerContext_
@@ -624,15 +632,22 @@ class MacAudioInputBackend final : public AudioInputBackend {
     list.mBuffers[0].mDataByteSize = frames * sizeof(float);
     list.mBuffers[0].mData = self->renderBuffer_.data();
     const OSStatus status = AudioUnitRender(self->unit_, flags, timestamp, 1, frames, &list);
-    if (status != noErr) {
-      // Some drivers stop invoking the callback after the first render error,
-      // so waiting for repeated failures can lose the only notification.
-      self->callbackFailure_.store(static_cast<int32_t>(status), std::memory_order_release);
-      return status;
-    }
     const uint64_t callbackNs = static_cast<uint64_t>(
         static_cast<long double>(callbackTicks) *
         static_cast<long double>(self->nsPerHostTick_));
+    const auto disposition = detail::observeMacInputRender(
+        status, callbackNs, self->renderRecovery_, self->renderSliceDrops_);
+    if (disposition == detail::MacInputRenderDisposition::Fatal) {
+      // Other errors still fail immediately; persistent slice errors use the
+      // identical status publication/return path after the bounded grace.
+      self->callbackFailure_.store(static_cast<int32_t>(status), std::memory_order_release);
+      return status;
+    }
+    // Discard failed signal, not elapsed time: substitute bounded silence and
+    // use this callback's normal timestamps/push so take alignment survives.
+    // No unit property query/set or lifecycle repair is allowed here.
+    if (!detail::prepareMacInputRenderBlock(disposition, self->renderBuffer_.data(), frames))
+      return noErr;
     const bool hardwareValid =
         timestamp && (timestamp->mFlags & kAudioTimeStampHostTimeValid) &&
         timestamp->mHostTime != 0;
@@ -678,6 +693,8 @@ class MacAudioInputBackend final : public AudioInputBackend {
   AudioInputPush push_ = nullptr;
   void* context_ = nullptr;
   std::atomic<int32_t> callbackFailure_{0};
+  detail::MacInputRenderRecovery renderRecovery_;
+  std::atomic<uint64_t> renderSliceDrops_{0};
   std::shared_ptr<DeviceListenerContext> listenerContext_;
   dispatch_queue_t listenerQueue_ = nullptr;
   AudioObjectPropertyListenerBlock listenerBlock_ = nullptr;
