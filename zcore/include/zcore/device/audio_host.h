@@ -162,6 +162,12 @@ struct AudioHostConfig {
   // The writer must own the stream in this process. Other-process property
   // changes need not update an already-open provider's negotiated period.
   bool allowSharedDeviceBufferChange{false};
+  // macOS: retain this process's shared-device buffer change until this host
+  // stops, closes, fails, or loses its device, even when open writes nothing.
+  // Independent of write consent and callback capacity/negotiation ceilings;
+  // it does not pin a period or prevent external changes. Default false.
+  // Other platforms ignore this field. Set before open; live writes retain it.
+  bool holdSharedDeviceBuffer{false};
 };
 
 struct AudioHostLatency {
@@ -293,8 +299,8 @@ class AudioHostBackend {
   // prepared maximumFrames, and is read back in result.latency.bufferFrames.
   // A rounded read-back is accepted only within the range and every active
   // owner's capacity/ceiling. An unsafe result triggers checked rollback.
-  // The device-wide property is shared with other apps. The last writer lease
-  // restores if the original fits every remaining lease's capacity/ceiling
+  // The device-wide property is shared with other apps. The last writer/hold
+  // lease restores if the original fits every remaining lease's capacity/ceiling
   // and the current value still matches our last write. Restoration is
   // advisory (status.bufferWarnings), never a stop-time Error. The optional
   // ceiling combines with the opening ceiling. Verify read-back and compare

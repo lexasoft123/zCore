@@ -43,13 +43,13 @@ struct Properties {
   int reads = 0, writes = 0, rangeReads = 0;
   int failReadAt = 0, failWriteAt = 0;
   uint32_t negotiatedOverride = 0;
-  bool readableRange = true, settable = true;
+  bool readableRange = true, settable = true, present = true;
   int identityChecks = 0, failIdentityAt = 0;
   std::string uid = "fake:buffer";
   uint64_t identity = 1;
   const std::string& deviceUid() const { return uid; }
   uint64_t deviceIdentity() const { return identity; }
-  bool identityMatches() { return ++identityChecks != failIdentityAt; }
+  bool identityMatches() { return ++identityChecks != failIdentityAt && present; }
   bool isSettable() const { return settable; }
   bool readFrames(uint32_t& value) {
     if (++reads == failReadAt) return false;
@@ -107,13 +107,35 @@ class LiveHost final : public FakeHost {
               current.format, current.latency, "Shared-device opt-in required"};
     const auto change = singz::detail::requestMacAudioBuffer(properties,
         config.requestedBufferFrames, config.maximumFrames, ownership,
-        config.maximumAcceptableBufferFrames, ledger);
+        config.maximumAcceptableBufferFrames, ledger, true,
+        singz::detail::MacAudioBufferFixedCapacity{}, config.holdSharedDeviceBuffer);
     current.bufferWarnings |= change.warnings;
     if (change.ok()) {
       current.latency.bufferFrames = change.frames;
       current.format.nominalBufferFrames = change.frames;
     }
+    if (!change.ok() || failAfterLease) {
+      stop();
+      current.state = singz::AudioHostState::Error;
+      return {false, singz::AudioHostError::ProviderFailure, current.state,
+              current.format, current.latency, "Fake opening failure"};
+    }
     return {change.ok(), change.error, current.state, current.format, current.latency, change.message};
+  }
+  bool failAfterLease = false, failStart = false;
+  singz::AudioHostResult start() override {
+    if (!failStart) return FakeHost::start();
+    stop();
+    current.state = singz::AudioHostState::Error;
+    return {false, singz::AudioHostError::ProviderFailure, current.state,
+            current.format, current.latency, "Fake start failure"};
+  }
+  void deviceLost() {
+    // Same independent snapshot released by the production serial listener.
+    auto listenerOwnership = ownership;
+    current.bufferWarnings |= singz::detail::restoreMacAudioBuffer(
+        properties, listenerOwnership, ledger);
+    current.state = singz::AudioHostState::DeviceLost;
   }
   void stop() noexcept override {
     current.bufferWarnings |= singz::detail::restoreMacAudioBuffer(properties, ownership, ledger);
@@ -784,6 +806,165 @@ void capacityOnlySong() {
   }
 }
 
+void sharedBufferHolds() {
+  using namespace singz;
+  using namespace singz::detail;
+  CHECK(!AudioHostConfig{}.holdSharedDeviceBuffer);
+  // Zero and equal requests both register a hold before the fast return.
+  // Exercise both release orders and leave independent capture armed.
+  for (uint32_t songRequest : {0u, 32u}) {
+    for (bool songFirst : {false, true}) {
+      Properties p; p.minimum = 32;
+      MacAudioBufferLedger ledger;
+      MacAudioBufferOwnership capture;
+      CHECK(requestMacAudioBuffer(p, 0, 4096, capture, 0, ledger, false).ok());
+      AudioHostConfig config;
+      config.maximumFrames = 4096;
+      config.requestedBufferFrames = 32;
+      config.maximumAcceptableBufferFrames = 256;
+      config.allowSharedDeviceBufferChange = true;
+      config.holdSharedDeviceBuffer = true;
+      AudioHost monitor(std::make_unique<LiveHost>(&p, &ledger));
+      CHECK(monitor.open(config, nullptr, nullptr).ok && monitor.start().ok);
+      config.requestedBufferFrames = songRequest;
+      config.maximumAcceptableBufferFrames = 0;
+      config.allowSharedDeviceBufferChange = songRequest != 0;
+      AudioHost song(std::make_unique<LiveHost>(&p, &ledger));
+      CHECK(song.open(config, nullptr, nullptr).ok && song.start().ok);
+      CHECK(p.frames == 32 && p.writes == 1);
+      if (songFirst) song.stop(); else monitor.stop();
+      CHECK(p.frames == 32 && p.writes == 1);
+      CHECK(song.status().bufferWarnings == 0 && monitor.status().bufferWarnings == 0);
+      if (songFirst) monitor.stop(); else song.stop();
+      CHECK(p.frames == 512 && p.writes == 2);
+      CHECK(ledger.devices.at(p.uid).owners.size() == 1 && capture.token != 0);
+      CHECK(restoreMacAudioBuffer(p, capture, ledger) == 0 && ledger.devices.empty());
+    }
+  }
+  // A hold opened first also retains later changes, including live writes.
+  {
+    Properties p; p.minimum = 32;
+    MacAudioBufferLedger ledger;
+    MacAudioBufferOwnership holder, writer;
+    CHECK(requestMacAudioBuffer(p, 0, 1024, holder, 0, ledger, true,
+                                MacAudioBufferFixedCapacity{}, true).ok());
+    CHECK(requestMacAudioBuffer(p, 32, 1024, writer, 256, ledger).ok());
+    CHECK(restoreMacAudioBuffer(p, writer, ledger) == 0 && p.frames == 32);
+    CHECK(requestMacAudioBuffer(p, 64, 1024, holder, 0, ledger).ok());
+    CHECK(ledger.devices.at(p.uid).owners.at(holder.token).hold);
+    CHECK(restoreMacAudioBuffer(p, holder, ledger) == 0 && p.frames == 512);
+  }
+  // Monitor joins an existing small buffer without writing, then outlives song.
+  {
+    Properties p; p.minimum = 32;
+    MacAudioBufferLedger ledger;
+    MacAudioBufferOwnership song, monitor;
+    CHECK(requestMacAudioBuffer(p, 32, 1024, song, 0, ledger).ok());
+    CHECK(requestMacAudioBuffer(p, 32, 1024, monitor, 256, ledger, true,
+                                MacAudioBufferFixedCapacity{}, true).ok());
+    // A no-write live call must preserve the opening hold.
+    CHECK(requestMacAudioBuffer(p, 32, 1024, monitor, 256, ledger).ok());
+    CHECK(restoreMacAudioBuffer(p, song, ledger) == 0 && p.frames == 32);
+    CHECK(restoreMacAudioBuffer(p, monitor, ledger) == 0 && p.frames == 512);
+  }
+  // A hold still enforces original callback capacity and negotiation ceilings.
+  for (bool ceiling : {false, true}) {
+    Properties p; p.minimum = 32;
+    MacAudioBufferLedger ledger;
+    MacAudioBufferOwnership writer, rejected;
+    CHECK(requestMacAudioBuffer(p, 32, 1024, writer, 256, ledger).ok());
+    CHECK(!requestMacAudioBuffer(p, 0, ceiling ? 1024 : 256, rejected,
+        ceiling ? 16 : 0, ledger, true, MacAudioBufferFixedCapacity{}, true).ok());
+    CHECK(rejected.token == 0 && ledger.devices.at(p.uid).owners.size() == 1);
+    CHECK(restoreMacAudioBuffer(p, writer, ledger) == 0 && p.frames == 512);
+  }
+  // Baseline and CAS protection survive after the writer exits but a hold lives.
+  {
+    Properties p; p.minimum = 32;
+    MacAudioBufferLedger ledger;
+    MacAudioBufferOwnership writer, holder, contender;
+    CHECK(requestMacAudioBuffer(p, 32, 1024, writer, 256, ledger).ok());
+    CHECK(requestMacAudioBuffer(p, 0, 1024, holder, 0, ledger, true,
+                                MacAudioBufferFixedCapacity{}, true).ok());
+    CHECK(restoreMacAudioBuffer(p, writer, ledger) == 0 && p.frames == 32);
+    p.frames = 128; // external app wins; an active hold cannot adopt its baseline
+    CHECK(!requestMacAudioBuffer(p, 64, 1024, contender, 0, ledger).ok());
+    CHECK(ledger.devices.at(p.uid).original == 512 && contender.token == 0);
+    CHECK(restoreMacAudioBuffer(p, holder, ledger) == AudioBufferWarningExternalChange);
+    CHECK(p.frames == 128 && p.writes == 1 && ledger.devices.empty());
+  }
+  // Destruction, opening/start failure, and device loss all release a hold.
+  for (int ending = 0; ending != 5; ++ending) {
+    Properties p; p.minimum = 32;
+    MacAudioBufferLedger ledger;
+    MacAudioBufferOwnership writer;
+    CHECK(requestMacAudioBuffer(p, 32, 1024, writer, 256, ledger).ok());
+    auto backend = std::make_unique<LiveHost>(&p, &ledger);
+    auto* provider = backend.get();
+    provider->failAfterLease = ending == 1;
+    provider->failStart = ending == 2;
+    {
+      AudioHost host(std::move(backend));
+      AudioHostConfig config;
+      config.holdSharedDeviceBuffer = true;
+      CHECK(host.open(config, nullptr, nullptr).ok == (ending != 1));
+      if (ending != 1) CHECK(host.start().ok == (ending != 2));
+      CHECK(restoreMacAudioBuffer(p, writer, ledger) == 0);
+      if (ending == 1 || ending == 2) CHECK(p.frames == 512 && ledger.devices.empty());
+      else CHECK(p.frames == 32);
+      if (ending >= 3) {
+        if (ending == 4) p.present = false; // dead/replaced HAL object: no unsafe write
+        provider->deviceLost();
+        CHECK(host.status().state == AudioHostState::DeviceLost);
+        CHECK(ledger.devices.empty());
+        CHECK(p.frames == (ending == 4 ? 32u : 512u));
+        CHECK(host.status().bufferWarnings == (ending == 4 ? AudioBufferWarningRestoreFailed : 0u));
+      }
+    }
+    CHECK(ledger.devices.empty());
+    CHECK(p.frames == (ending == 4 ? 32u : 512u));
+  }
+  // A duplicate device-loss/stop snapshot cannot retry a failed restore.
+  // Only a real remaining lease release may retry it.
+  {
+    Properties p; p.minimum = 32;
+    MacAudioBufferLedger ledger;
+    MacAudioBufferOwnership holder, capture;
+    CHECK(requestMacAudioBuffer(p, 32, 1024, holder, 0, ledger, true,
+                                MacAudioBufferFixedCapacity{}, true).ok());
+    CHECK(requestMacAudioBuffer(p, 0, 1024, capture, 0, ledger, false).ok());
+    auto snapshot = holder;
+    p.failWriteAt = p.writes + 1;
+    CHECK(restoreMacAudioBuffer(p, holder, ledger) == AudioBufferWarningRestoreFailed);
+    const auto writes = p.writes;
+    p.failWriteAt = 0;
+    CHECK(restoreMacAudioBuffer(p, snapshot, ledger) == 0 && snapshot.token == 0);
+    CHECK(p.frames == 32 && p.writes == writes);
+    CHECK(restoreMacAudioBuffer(p, capture, ledger) == 0 && p.frames == 512);
+    CHECK(ledger.devices.empty());
+  }
+  // Stop and the serial device-loss listener can race with independent copies.
+  // A stale snapshot is harmless even with another capacity lease remaining.
+  {
+    Properties p; p.minimum = 32;
+    MacAudioBufferLedger ledger;
+    MacAudioBufferOwnership writer, holder, capture;
+    CHECK(requestMacAudioBuffer(p, 32, 1024, writer, 256, ledger).ok());
+    CHECK(requestMacAudioBuffer(p, 0, 1024, holder, 0, ledger, true,
+                                MacAudioBufferFixedCapacity{}, true).ok());
+    CHECK(requestMacAudioBuffer(p, 0, 1024, capture, 0, ledger, false).ok());
+    CHECK(restoreMacAudioBuffer(p, writer, ledger) == 0 && p.frames == 32);
+    auto snapshot = holder;
+    std::atomic<uint32_t> warnings{0};
+    std::thread listener([&] { warnings.fetch_or(restoreMacAudioBuffer(p, snapshot, ledger)); });
+    warnings.fetch_or(restoreMacAudioBuffer(p, holder, ledger));
+    listener.join();
+    CHECK(warnings.load() == 0 && p.frames == 512 && p.writes == 2);
+    CHECK(ledger.devices.at(p.uid).owners.size() == 1);
+    CHECK(restoreMacAudioBuffer(p, capture, ledger) == 0 && ledger.devices.empty());
+  }
+}
+
 void inputApi() {
   CHECK(singz::AudioInputConfig{}.requestedBufferFrames == 0);
   CHECK(!singz::AudioInputConfig{}.allowSharedDeviceBufferChange);
@@ -854,7 +1035,7 @@ void inputApi() {
 }  // namespace
 
 int main() {
-  choices(); transactions(); hostApi(); songLiveAdoption(); configurationNotifications(); routeReadFailures(); capacityOnlySong(); inputApi(); retainedMacInputApi();
+  choices(); transactions(); hostApi(); songLiveAdoption(); configurationNotifications(); routeReadFailures(); capacityOnlySong(); sharedBufferHolds(); inputApi(); retainedMacInputApi();
   if (!failures) std::puts("PASS monitor buffer selection, property transactions and fake backend APIs");
   return failures ? 1 : 0;
 }

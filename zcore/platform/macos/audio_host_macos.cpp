@@ -44,6 +44,9 @@ struct HostDeviceListenerContext {
   std::atomic<uint32_t> bufferFrames{0};
   std::atomic<uint32_t> bufferWarnings{AudioBufferWarningNone};
   std::atomic<uint32_t> deviceLost{0};
+  // Independent token snapshot: only the serial listener queue mutates this
+  // copy; the backend releases its own copy under the control mutex.
+  detail::MacAudioBufferOwnership bufferOwnership;
 };
 
 // The copied block retains its context. Exceptional failed removal keeps the
@@ -502,7 +505,8 @@ class MacAudioHostBackend final : public AudioHostBackend {
     detail::MacAudioBufferProperties bufferProperties{selectedDevice_, selectedDeviceUid_};
     const auto buffer = detail::requestMacAudioBuffer(
         bufferProperties, config.requestedBufferFrames, config.maximumFrames,
-        bufferOwnership_, acceptableBufferMaximum_);
+        bufferOwnership_, acceptableBufferMaximum_, detail::macAudioBufferLedger(),
+        true, detail::MacAudioBufferFixedCapacity{}, config.holdSharedDeviceBuffer);
     bufferWarnings_ |= buffer.warnings;
     if (!buffer.ok()) return fail(buffer.error, buffer.message);
     const UInt32 nominalFrames = buffer.frames;
@@ -597,6 +601,7 @@ class MacAudioHostBackend final : public AudioHostBackend {
     listenerContext_->device = selectedDevice_;
     listenerContext_->uid = selectedDeviceUid_;
     listenerContext_->hasInput = hasInput;
+    listenerContext_->bufferOwnership = bufferOwnership_;
     listenerContext_->bufferFrames.store(nominalFrames, std::memory_order_relaxed);
     listenerContext_->routeGeneration.store(
         lastRouteGeneration_.fetch_add(1, std::memory_order_relaxed) + 1,
@@ -668,8 +673,20 @@ class MacAudioHostBackend final : public AudioHostBackend {
             listener->bufferWarnings.fetch_or(AudioBufferWarningReadFailed, std::memory_order_relaxed);
         }
       }
-      if ((changes & kAliveChanged) != 0)
+      if ((changes & kAliveChanged) != 0) {
+        // Device loss ends the lease without waiting for a status poll/stop.
+        // This queue is a control domain; callbacks never touch the ledger.
+        detail::MacAudioBufferProperties properties{listener->device, listener->uid};
+        try {
+          listener->bufferWarnings.fetch_or(
+              detail::restoreMacAudioBuffer(properties, listener->bufferOwnership),
+              std::memory_order_relaxed);
+        } catch (...) {
+          listener->bufferWarnings.fetch_or(AudioBufferWarningRestoreFailed,
+                                            std::memory_order_relaxed);
+        }
         listener->deviceLost.store(1, std::memory_order_release);
+      }
       if (changes != 0) {
         listener->pendingChanges.fetch_or(changes, std::memory_order_release);
         listener->routeGeneration.fetch_add(1, std::memory_order_relaxed);

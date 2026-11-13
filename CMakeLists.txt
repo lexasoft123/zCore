@@ -322,14 +322,29 @@ if(ZCORE_BUILD_TESTS)
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS zcore/platform/macos/audio_device_macos_buffer.h)
   file(READ "${CMAKE_CURRENT_SOURCE_DIR}/zcore/platform/macos/audio_host_macos_helpers.h" _host_facts)
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS zcore/platform/macos/audio_host_macos_helpers.h)
-  foreach(_mutant IN ITEMS live_owner external_restore stale_expected accept_if_fits rollback_observed echo_request waits_all_leases unchanged_configuration stale_baseline unscoped no_retry unknown_lost stream_removal)
+  foreach(_mutant IN ITEMS ignore_hold unchanged_hold live_drops_hold stale_release live_owner external_restore stale_expected accept_if_fits rollback_observed echo_request waits_all_leases unchanged_configuration stale_baseline unscoped no_retry unknown_lost stream_removal)
     set(_mutated "${_buffer_transaction}")
     set(_mutated_facts "${_host_facts}")
-    if(_mutant STREQUAL "live_owner")
-      string(REPLACE "if (owner.second.changed) return AudioBufferWarningNone;"
+    if(_mutant STREQUAL "ignore_hold")
+      # Reintroduce writer-only restoration, including the unchanged song join.
+      string(REPLACE "if (owner.second.changed || owner.second.hold) return AudioBufferWarningNone;"
+        "if (owner.second.changed) return AudioBufferWarningNone;" _mutated "${_mutated}")
+    elseif(_mutant STREQUAL "unchanged_hold")
+      string(REPLACE "entry.owners.at(ownership.token).hold |= holdSharedDeviceBuffer;"
+        "if (candidate != before) entry.owners.at(ownership.token).hold |= holdSharedDeviceBuffer;"
+        _mutated "${_mutated}")
+    elseif(_mutant STREQUAL "live_drops_hold")
+      string(REPLACE "entry.owners.at(ownership.token).hold |= holdSharedDeviceBuffer;"
+        "entry.owners.at(ownership.token).hold = holdSharedDeviceBuffer;"
+        _mutated "${_mutated}")
+    elseif(_mutant STREQUAL "stale_release")
+      string(REPLACE "if (erased == 0) return AudioBufferWarningNone;"
+        "if (false) return AudioBufferWarningNone;" _mutated "${_mutated}")
+    elseif(_mutant STREQUAL "live_owner")
+      string(REPLACE "if (owner.second.changed || owner.second.hold) return AudioBufferWarningNone;"
         "if (false) return AudioBufferWarningNone;" _mutated "${_mutated}")
     elseif(_mutant STREQUAL "waits_all_leases")
-      string(REPLACE "if (owner.second.changed) return AudioBufferWarningNone;"
+      string(REPLACE "if (owner.second.changed || owner.second.hold) return AudioBufferWarningNone;"
         "if (!entry.owners.empty()) return AudioBufferWarningNone;" _mutated "${_mutated}")
     elseif(_mutant STREQUAL "unchanged_configuration")
       string(REPLACE "!readable || !same" "true"

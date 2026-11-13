@@ -23,6 +23,7 @@ struct MacAudioBufferLedger {
     uint32_t preparedMaximum;
     uint32_t acceptableMaximum;
     bool changed = false;
+    bool hold = false;
   };
   struct Entry {
     uint64_t identity = 0;
@@ -80,10 +81,11 @@ inline uint32_t macAudioBufferCeiling(uint32_t first, uint32_t second) {
 }
 
 // An observed external value becomes the next lifetime's restoration baseline
-// only after all writers have gone. Capacity-only leases do not own a value.
+// only after all writers and explicit holds have gone. Capacity-only leases
+// do not retain a value. Holds protect the baseline even after its writer exits.
 inline bool macAudioBufferHasWriter(const MacAudioBufferLedger::Entry& entry) {
   return entry.changed && std::any_of(entry.owners.begin(), entry.owners.end(),
-      [](const auto& owner) { return owner.second.changed; });
+      [](const auto& owner) { return owner.second.changed || owner.second.hold; });
 }
 inline void rebaselineMacAudioBuffer(MacAudioBufferLedger::Entry& entry, uint32_t current) {
   entry.original = entry.lastWritten = current;
@@ -115,7 +117,8 @@ MacAudioBufferResult requestMacAudioBuffer(
     Access& access, uint32_t requested, uint32_t preparedMaximum,
     MacAudioBufferOwnership& ownership, uint32_t acceptableMaximum = 0,
     MacAudioBufferLedger& ledger = macAudioBufferLedger(),
-    bool requireOriginalCapacity = true, PrepareCapacity prepareCapacity = {}) {
+    bool requireOriginalCapacity = true, PrepareCapacity prepareCapacity = {},
+    bool holdSharedDeviceBuffer = false) {
   std::lock_guard lock(ledger.mutex);
   uint32_t warnings = AudioBufferWarningNone;
   uint32_t before = 0;
@@ -190,6 +193,9 @@ MacAudioBufferResult requestMacAudioBuffer(
     entry.owners.emplace(ownership.token,
                          MacAudioBufferLedger::Owner{preparedMaximum, acceptableMaximum});
   }
+  // Register explicit holds before the unchanged-request fast path. A live
+  // request cannot drop the opening hold; only lifetime release removes it.
+  entry.owners.at(ownership.token).hold |= holdSharedDeviceBuffer;
   if (candidate == before) return {AudioHostError::None, before, {}, warnings};
   const bool previouslyChanged = entry.changed;
   const auto write = writeMacAudioBuffer(access, before, candidate);
@@ -248,7 +254,7 @@ MacAudioBufferResult requestMacAudioBuffer(
                           : "CoreAudio checked write or read-back and rollback failed"), warnings};
 }
 
-// Soft advisory release: the last writer restores while capacity-only leases
+// Soft advisory release: the last writer/hold restores while capacity-only leases
 // remain, if their budgets permit. Never overwrite a third-party change.
 // A refused/failed restore retains the baseline for a later release to retry.
 template <class Access>
@@ -259,10 +265,14 @@ uint32_t restoreMacAudioBuffer(Access& access, MacAudioBufferOwnership& ownershi
   const auto found = ledger.devices.find(ownership.uid);
   if (found == ledger.devices.end()) { ownership = {}; return AudioBufferWarningNone; }
   auto& entry = found->second;
-  entry.owners.erase(ownership.token);
+  // The listener and host control thread may release independent snapshots
+  // of the same token on device loss/stop. A stale snapshot must not retry a
+  // restore or affect a later lifetime that still has capacity-only leases.
+  const auto erased = entry.owners.erase(ownership.token);
   ownership = {};
+  if (erased == 0) return AudioBufferWarningNone;
   for (const auto& owner : entry.owners)
-    if (owner.second.changed) return AudioBufferWarningNone;
+    if (owner.second.changed || owner.second.hold) return AudioBufferWarningNone;
   uint32_t warning = AudioBufferWarningNone;
   if (entry.changed) {
     uint32_t current = 0;
@@ -273,7 +283,7 @@ uint32_t restoreMacAudioBuffer(Access& access, MacAudioBufferOwnership& ownershi
       // LoopZ BufferPeriod's already-restored case: no further write needed.
     } else if (current != entry.lastWritten) {
       // Preserve and adopt the external value before checking restore budgets;
-      // no process writer remains, so the old baseline must not poison re-arm.
+      // no process writer/hold remains, so the old baseline must not poison re-arm.
       warning = AudioBufferWarningExternalChange;
       rebaselineMacAudioBuffer(entry, current);
     } else if (entry.original != entry.lastWritten) {

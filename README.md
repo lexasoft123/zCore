@@ -90,14 +90,26 @@ to the current device range and report the read-back size in
 `AudioInputResult::inputBufferFrames` or `AudioHostResult::latency.bufferFrames`.
 Input latency continues to exclude the I/O buffer. These CoreAudio settings are
 device-wide and shared with other apps. A shared process-wide ledger retains the
-original and restores when the last lease that wrote the buffer closes, even
+original and restores when the last writer or explicit hold lease ends, even
 while capacity-only leases remain, if the original fits every remaining
-prepared capacity and ceiling. A refused restore is a soft warning and can be
-retried on a later release. Restoration only writes while the current value
+prepared capacity and ceiling. `AudioHostConfig::holdSharedDeviceBuffer = true`
+registers a hold at open even if the requested period is zero or already current.
+For example, a monitor lowers 512 to 32 frames, then a song opens with a hold:
+monitor stop keeps 32 without a restore-failure warning; song stop restores 512,
+even if independent ordinary capture remains open. Set a hold on each host that
+needs this lifetime, including a monitor that may join an already-small buffer.
+The default is false; ordinary capture capacity alone does not retain the value.
+A hold is independent of `allowSharedDeviceBufferChange` write consent and
+`maximumAcceptableBufferFrames`; it neither writes nor pins a specific period.
+It is released on stop, destruction/reopen, opening/start failure, or device loss;
+live buffer requests preserve the opening hold. Other platforms ignore the field.
+The field is appended to the config; no existing member or virtual method changes.
+Rebuild C++ consumers with the updated header. A refused restore is a soft warning
+and can be retried on a later release. Restoration only writes while the current value
 still matches this process's last write. Stop-time restore failures
 and external changes are soft `bufferWarnings` in host status or input stats.
-Once no writer remains, an external value becomes the next restoration baseline,
-so a capacity-only song lease does not block re-enabling monitoring.
+Once no writer or hold remains, an external value becomes the next restoration
+baseline, so a capacity-only song lease does not block re-enabling monitoring.
 An ordinary input stop releases its lease; an explicit retained-prepared stop
 keeps the stopped unit and lease for fast re-arm until a real close. This opt-in per-lifetime policy differs from LoopZ's
 explicit persistent per-device setting.
