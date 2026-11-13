@@ -125,8 +125,19 @@ Call lifecycle and status methods from an ordinary control worker. Status takes
 the control mutex and can wait behind blocking HAL transactions; do not call it
 from a UI or realtime-sensitive thread. Ordinary input capture sizes its render
 storage from the larger of the reported slice (or 4096-frame fallback with a
-warning) and current device buffer, capped at 16384 frames. No AUHAL capacity
-is forced. Unchanged capture holds a capacity-only lease and can open when the
+warning), current device buffer and the ledger's original buffer, capped at
+16384 frames. Capacity selection and lease registration share one ledger
+transaction. Before initialization, AUHAL's maximum slice is raised only when
+the chosen storage needs it; rejected settings produce an advisory warning.
+After initialization, the lease reserves the smaller of storage and the
+confirmed unit slice. An unreadable unit limit reserves zero until close;
+restoration above a remaining reservation is refused softly. Ordinary capture
+still opens when this optional setting/readback fails.
+Unchanged input stream-configuration notifications are benign; input stream
+IDs, physical/virtual formats, rate and per-buffer channel layout are compared
+after one retry of a failed read. Buffer-only notifications remain advisory.
+Retained re-arm re-reads these facts and rejects a changed route before start,
+even without a pending notification. Unchanged capture holds a capacity-only lease and can open when the
 device property exceeds that cap; an oversized callback is dropped safely and
 reported as a capture failure. A 4096-frame mono render plane uses 16 KiB,
 with the existing hard limit bounding it at 64 KiB.

@@ -90,14 +90,32 @@ inline void rebaselineMacAudioBuffer(MacAudioBufferLedger::Entry& entry, uint32_
   entry.changed = false;
 }
 
+struct MacAudioBufferFixedCapacity {
+  uint32_t operator()(uint32_t prepared, uint32_t, uint32_t) const { return prepared; }
+};
+
+// Post-initialize input confirmation only revises this owner's reservation;
+// it never writes the device or changes any other owner's ceiling.
+inline bool updateMacAudioBufferCapacity(const MacAudioBufferOwnership& ownership,
+                                        uint32_t capacity,
+                                        MacAudioBufferLedger& ledger = macAudioBufferLedger()) {
+  std::lock_guard lock(ledger.mutex);
+  const auto device = ledger.devices.find(ownership.uid);
+  if (device == ledger.devices.end()) return false;
+  const auto owner = device->second.owners.find(ownership.token);
+  if (owner == device->second.owners.end()) return false;
+  owner->second.preparedMaximum = capacity;
+  return true;
+}
+
 // Control-domain property transaction. Access supplies UID identity and HAL
 // property operations. The same seam exercises the real ledger in unit tests.
-template <class Access>
+template <class Access, class PrepareCapacity = MacAudioBufferFixedCapacity>
 MacAudioBufferResult requestMacAudioBuffer(
     Access& access, uint32_t requested, uint32_t preparedMaximum,
     MacAudioBufferOwnership& ownership, uint32_t acceptableMaximum = 0,
     MacAudioBufferLedger& ledger = macAudioBufferLedger(),
-    bool requireOriginalCapacity = true) {
+    bool requireOriginalCapacity = true, PrepareCapacity prepareCapacity = {}) {
   std::lock_guard lock(ledger.mutex);
   uint32_t warnings = AudioBufferWarningNone;
   uint32_t before = 0;
@@ -126,6 +144,10 @@ MacAudioBufferResult requestMacAudioBuffer(
   }
   const uint32_t original = existing == ledger.devices.end() || existing->second.original == 0
       ? before : existing->second.original;
+  // Choose storage and reserve that exact capacity in the same transaction.
+  // In particular, an input opened under a lowered buffer must also fit the
+  // ledger baseline that another owner's release can restore.
+  preparedMaximum = prepareCapacity(preparedMaximum, before, original);
   // Hosts must fit the original/current stream. Input configures its buffer
   // BEFORE starting, so a reduction only needs to fit the future candidate;
   // its lease then prevents growth beyond the prepared input slice.

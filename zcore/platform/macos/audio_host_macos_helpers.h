@@ -1,4 +1,5 @@
-#pragma once
+#ifndef SINGZ_AUDIO_HOST_MACOS_HELPERS_H
+#define SINGZ_AUDIO_HOST_MACOS_HELPERS_H
 
 #include <cmath>
 #include <cstddef>
@@ -260,3 +261,5 @@ inline bool checkedAudioHostBufferRange(double minimum, double maximum,
 }
 
 }  // namespace singz::detail
+
+#endif  // SINGZ_AUDIO_HOST_MACOS_HELPERS_H
