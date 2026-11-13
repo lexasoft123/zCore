@@ -17,11 +17,12 @@ struct MacAudioBufferOwnership {
 
 // A single ledger is shared by all zCore input/output backends. Only ordinary
 // control threads lock it; callbacks never reference it. Register unchanged
-// streams too: they must keep a smaller buffer alive until they close.
+// streams too: their prepared capacities constrain writes and restoration.
 struct MacAudioBufferLedger {
   struct Owner {
     uint32_t preparedMaximum;
     uint32_t acceptableMaximum;
+    bool changed = false;
   };
   struct Entry {
     uint64_t identity = 0;
@@ -40,6 +41,7 @@ struct MacAudioBufferResult {
   AudioHostError error = AudioHostError::None;
   uint32_t frames = 0;
   std::string message;
+  uint32_t warnings = AudioBufferWarningNone;
   bool ok() const { return error == AudioHostError::None; }
 };
 
@@ -77,6 +79,17 @@ inline uint32_t macAudioBufferCeiling(uint32_t first, uint32_t second) {
   return first == 0 ? second : (second == 0 ? first : std::min(first, second));
 }
 
+// An observed external value becomes the next lifetime's restoration baseline
+// only after all writers have gone. Capacity-only leases do not own a value.
+inline bool macAudioBufferHasWriter(const MacAudioBufferLedger::Entry& entry) {
+  return entry.changed && std::any_of(entry.owners.begin(), entry.owners.end(),
+      [](const auto& owner) { return owner.second.changed; });
+}
+inline void rebaselineMacAudioBuffer(MacAudioBufferLedger::Entry& entry, uint32_t current) {
+  entry.original = entry.lastWritten = current;
+  entry.changed = false;
+}
+
 // Control-domain property transaction. Access supplies UID identity and HAL
 // property operations. The same seam exercises the real ledger in unit tests.
 template <class Access>
@@ -86,21 +99,31 @@ MacAudioBufferResult requestMacAudioBuffer(
     MacAudioBufferLedger& ledger = macAudioBufferLedger(),
     bool requireOriginalCapacity = true) {
   std::lock_guard lock(ledger.mutex);
+  uint32_t warnings = AudioBufferWarningNone;
   uint32_t before = 0;
   if (!access.identityMatches())
-    return {AudioHostError::ProviderFailure, 0, "CoreAudio device identity or buffer size is unavailable"};
+    return {AudioHostError::ProviderFailure, 0, "CoreAudio device identity or buffer size is unavailable", warnings};
   const bool sizeKnown = access.readFrames(before) && before != 0;
   if (!sizeKnown) {
     // Ordinary input can retain a capacity-only lease without optional buffer
     // metadata. It still constrains future writes if the property recovers.
     if (requireOriginalCapacity || requested != 0 || acceptableMaximum != 0)
-      return {AudioHostError::ProviderFailure, 0, "CoreAudio buffer size is unavailable"};
+      return {AudioHostError::ProviderFailure, 0, "CoreAudio buffer size is unavailable", warnings};
     before = 0;
   }
   const std::string& uid = access.deviceUid();
   const auto existing = ledger.devices.find(uid);
   if (existing != ledger.devices.end() && existing->second.identity != access.deviceIdentity())
-    return {AudioHostError::InvalidState, before, "CoreAudio device identity changed while buffer leases remain"};
+    return {AudioHostError::InvalidState, before, "CoreAudio device identity changed while buffer leases remain", warnings};
+  if (ownership.token != 0 && (ownership.uid != uid || existing == ledger.devices.end() ||
+                               !existing->second.owners.contains(ownership.token)))
+    return {AudioHostError::InvalidState, before, "CoreAudio buffer lease identity changed", warnings};
+  if (existing != ledger.devices.end() && sizeKnown &&
+      existing->second.lastWritten != 0 && before != existing->second.lastWritten &&
+      !macAudioBufferHasWriter(existing->second)) {
+    rebaselineMacAudioBuffer(existing->second, before);
+    warnings |= AudioBufferWarningExternalChange;
+  }
   const uint32_t original = existing == ledger.devices.end() || existing->second.original == 0
       ? before : existing->second.original;
   // Hosts must fit the original/current stream. Input configures its buffer
@@ -108,12 +131,12 @@ MacAudioBufferResult requestMacAudioBuffer(
   // its lease then prevents growth beyond the prepared input slice.
   if (requireOriginalCapacity && (original > preparedMaximum || before > preparedMaximum))
     return {AudioHostError::InvalidConfiguration, before,
-            "Callback maximumFrames must fit the original and current shared CoreAudio buffer"};
+            "Callback maximumFrames must fit the original and current shared CoreAudio buffer", warnings};
   uint32_t candidate = before;
   uint32_t minimum = 0, maximum = 0;
   if (requested != 0) {
     if (!access.readRange(minimum, maximum) || minimum == 0 || maximum < minimum)
-      return {AudioHostError::ProviderFailure, before, "CoreAudio buffer range is unavailable"};
+      return {AudioHostError::ProviderFailure, before, "CoreAudio buffer range is unavailable", warnings};
     candidate = std::clamp(requested, minimum, maximum);
   }
   // An unchanged ordinary input is a capacity-only reservation. Optional
@@ -123,21 +146,19 @@ MacAudioBufferResult requestMacAudioBuffer(
   if ((!capacityOnly && candidate > preparedMaximum) ||
       (acceptableMaximum != 0 && candidate > acceptableMaximum))
     return {AudioHostError::InvalidConfiguration, before,
-            "CoreAudio buffer exceeds the maximum acceptable buffer frames"};
+            "CoreAudio buffer exceeds the maximum acceptable buffer frames", warnings};
   if (existing != ledger.devices.end()) {
     for (const auto& owner : existing->second.owners)
       if (candidate != before && (candidate > owner.second.preparedMaximum ||
           (owner.second.acceptableMaximum != 0 && candidate > owner.second.acceptableMaximum))
          )
         return {AudioHostError::InvalidConfiguration, before,
-                "CoreAudio buffer exceeds an active stream's capacity or acceptable ceiling"};
-    if (candidate != before && existing->second.lastWritten != 0 && before != existing->second.lastWritten)
+                "CoreAudio buffer exceeds an active stream's capacity or acceptable ceiling", warnings};
+    if (candidate != before && macAudioBufferHasWriter(existing->second) &&
+        existing->second.lastWritten != 0 && before != existing->second.lastWritten)
       return {AudioHostError::ProviderFailure, before,
-              "Shared CoreAudio buffer changed externally; close leases and refresh before writing"};
+              "Shared CoreAudio buffer changed externally; close leases and refresh before writing", warnings};
   }
-  if (ownership.token != 0 && (ownership.uid != uid || existing == ledger.devices.end() ||
-                               !existing->second.owners.contains(ownership.token)))
-    return {AudioHostError::InvalidState, before, "CoreAudio buffer lease identity changed"};
   auto& entry = ledger.devices.try_emplace(uid,
       MacAudioBufferLedger::Entry{access.deviceIdentity(), original, before, false, {}}).first->second;
   if (sizeKnown && entry.original == 0) entry.original = before;
@@ -147,7 +168,7 @@ MacAudioBufferResult requestMacAudioBuffer(
     entry.owners.emplace(ownership.token,
                          MacAudioBufferLedger::Owner{preparedMaximum, acceptableMaximum});
   }
-  if (candidate == before) return {AudioHostError::None, before, {}};
+  if (candidate == before) return {AudioHostError::None, before, {}, warnings};
   const bool previouslyChanged = entry.changed;
   const auto write = writeMacAudioBuffer(access, before, candidate);
   bool fits = write.observed && write.frames >= minimum && write.frames <= maximum &&
@@ -164,10 +185,11 @@ MacAudioBufferResult requestMacAudioBuffer(
   if (write.wrote && fits) {
     entry.changed = previouslyChanged || write.frames != before;
     entry.lastWritten = write.frames;
+    if (write.frames != before) entry.owners.at(ownership.token).changed = true;
     return {AudioHostError::None, write.frames,
             write.frames == requested ? std::string{}
                 : "CoreAudio negotiated " + std::to_string(write.frames) +
-                      " buffer frames for request " + std::to_string(requested)};
+                      " buffer frames for request " + std::to_string(requested), warnings};
   }
   bool restored = !write.wrote;
   if (write.wrote) {
@@ -194,17 +216,19 @@ MacAudioBufferResult requestMacAudioBuffer(
       entry.changed = previouslyChanged;
     }
   }
+  if (write.wrote && !restored) entry.owners.at(ownership.token).changed = true;
   const bool unsafeReadBack = write.observed && !fits;
   return {AudioHostError::ProviderFailure, write.observed ? write.frames : 0,
           unsafeReadBack
               ? (restored ? "CoreAudio negotiated buffer exceeds range, capacity or maximum acceptable frames; previous size restored"
                           : "CoreAudio negotiated buffer exceeds range, capacity or maximum acceptable frames; rollback failed")
               : (restored ? "CoreAudio checked write or read-back failed; previous size retained/restored"
-                          : "CoreAudio checked write or read-back and rollback failed")};
+                          : "CoreAudio checked write or read-back and rollback failed"), warnings};
 }
 
-// Soft advisory release: keep the current setting until the LAST in-process
-// owner closes; never restore over a third-party change. No callback calls here.
+// Soft advisory release: the last writer restores while capacity-only leases
+// remain, if their budgets permit. Never overwrite a third-party change.
+// A refused/failed restore retains the baseline for a later release to retry.
 template <class Access>
 uint32_t restoreMacAudioBuffer(Access& access, MacAudioBufferOwnership& ownership,
                                MacAudioBufferLedger& ledger = macAudioBufferLedger()) {
@@ -215,7 +239,8 @@ uint32_t restoreMacAudioBuffer(Access& access, MacAudioBufferOwnership& ownershi
   auto& entry = found->second;
   entry.owners.erase(ownership.token);
   ownership = {};
-  if (!entry.owners.empty()) return AudioBufferWarningNone;
+  for (const auto& owner : entry.owners)
+    if (owner.second.changed) return AudioBufferWarningNone;
   uint32_t warning = AudioBufferWarningNone;
   if (entry.changed) {
     uint32_t current = 0;
@@ -225,13 +250,24 @@ uint32_t restoreMacAudioBuffer(Access& access, MacAudioBufferOwnership& ownershi
     } else if (current == entry.original) {
       // LoopZ BufferPeriod's already-restored case: no further write needed.
     } else if (current != entry.lastWritten) {
+      // Preserve and adopt the external value before checking restore budgets;
+      // no process writer remains, so the old baseline must not poison re-arm.
       warning = AudioBufferWarningExternalChange;
+      rebaselineMacAudioBuffer(entry, current);
     } else if (entry.original != entry.lastWritten) {
+      for (const auto& owner : entry.owners)
+        if (entry.original > owner.second.preparedMaximum ||
+            (owner.second.acceptableMaximum != 0 && entry.original > owner.second.acceptableMaximum))
+          return AudioBufferWarningRestoreFailed;
       const auto restored = writeMacAudioBuffer(access, entry.lastWritten, entry.original);
       if (!restored.confirmed) warning = AudioBufferWarningRestoreFailed;
     }
   }
-  ledger.devices.erase(found);
+  if (warning == AudioBufferWarningNone) {
+    entry.lastWritten = entry.original;
+    entry.changed = false;
+  }
+  if (entry.owners.empty()) ledger.devices.erase(found);
   return warning;
 }
 

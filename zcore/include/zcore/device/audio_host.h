@@ -293,9 +293,9 @@ class AudioHostBackend {
   // prepared maximumFrames, and is read back in result.latency.bufferFrames.
   // A rounded read-back is accepted only within the range and every active
   // owner's capacity/ceiling. An unsafe result triggers checked rollback.
-  // The device-wide property is shared with other apps. All in-process input
-  // and output leases defer restoration until the last closes, and restore
-  // only if the current value still matches our last write. Restoration is
+  // The device-wide property is shared with other apps. The last writer lease
+  // restores if the original fits every remaining lease's capacity/ceiling
+  // and the current value still matches our last write. Restoration is
   // advisory (status.bufferWarnings), never a stop-time Error. The optional
   // ceiling combines with the opening ceiling. Verify read-back and compare
   // status().observedCallbackFrames before monitoring; the parent decides if

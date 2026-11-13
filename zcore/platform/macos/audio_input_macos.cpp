@@ -283,6 +283,7 @@ class MacAudioInputBackend final : public AudioInputBackend {
       const auto buffer = detail::requestMacAudioBuffer(
           properties, config.requestedBufferFrames, maxFrames, bufferOwnership_,
           config.maximumAcceptableBufferFrames, detail::macAudioBufferLedger(), false);
+      bufferWarnings_ |= buffer.warnings;
       if (!buffer.ok()) return failMessage(buffer.message, config.channel);
       if (buffer.frames == 0) bufferWarnings_ |= AudioBufferWarningReadFailed;
     }

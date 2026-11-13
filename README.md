@@ -90,9 +90,14 @@ to the current device range and report the read-back size in
 `AudioInputResult::inputBufferFrames` or `AudioHostResult::latency.bufferFrames`.
 Input latency continues to exclude the I/O buffer. These CoreAudio settings are
 device-wide and shared with other apps. A shared process-wide ledger retains the
-original until the last input/output lease closes and restores only while the
-current value still matches this process's last write. Stop-time restore failures
+original and restores when the last lease that wrote the buffer closes, even
+while capacity-only leases remain, if the original fits every remaining
+prepared capacity and ceiling. A refused restore is a soft warning and can be
+retried on a later release. Restoration only writes while the current value
+still matches this process's last write. Stop-time restore failures
 and external changes are soft `bufferWarnings` in host status or input stats.
+Once no writer remains, an external value becomes the next restoration baseline,
+so a capacity-only song lease does not block re-enabling monitoring.
 An ordinary input stop releases its lease; an explicit retained-prepared stop
 keeps the stopped unit and lease for fast re-arm until a real close. This opt-in per-lifetime policy differs from LoopZ's
 explicit persistent per-device setting.
