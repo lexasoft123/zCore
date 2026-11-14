@@ -58,6 +58,26 @@ int main() {
   std::atomic<bool> stable{true};
   CHECK(singz::detail::macInputControlChanges(singz::detail::kMacInputLatencyChanged, stable) == 0);
   CHECK(!stable.load());
+
+  // Zen Quadro: a shared-device notification repeats the same 148-frame
+  // report. It must settle again; missing/changed facts must stay untrusted.
+  const auto zen = macInputLatency(148, 0, 0, 128, 48000, 48000, 48000);
+  std::atomic<uint64_t> revision{1};
+  singz::detail::refreshMacInputLatency(zen, stable, revision, [&] {
+    return macInputLatency(148, 0, 0, 512, 48000, 48000, 48000);
+  });
+  CHECK(stable.load());
+  singz::detail::refreshMacInputLatency(zen, stable, revision, [&] {
+    return macInputLatency(149, 0, 0, 128, 48000, 48000, 48000);
+  });
+  CHECK(!stable.load());
+  singz::detail::refreshMacInputLatency(zen, stable, revision, [] { return singz::detail::MacInputLatency{}; });
+  CHECK(!stable.load());
+  singz::detail::refreshMacInputLatency(zen, stable, revision, [&] {
+    revision.fetch_add(1);
+    return zen;
+  });
+  CHECK(!stable.load());
   stable.store(true);
   CHECK(singz::detail::macInputControlChanges(1u, stable) == 1u && stable.load());
   CHECK(singz::detail::macInputControlChanges(1u | singz::detail::kMacInputLatencyChanged, stable) == 1u);

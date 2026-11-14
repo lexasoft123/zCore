@@ -125,9 +125,10 @@ constexpr uint32_t macInputNotificationChanges(uint32_t selector) {
 
 // Latency notifications are advisory, not route failures. Preserve the fatal
 // alive/rate/channel bits for the existing lifecycle checks and invalidate the
-// latency snapshot even if a notification does not change the reported value.
+// latency snapshot even if a notification does not change the reported value;
+// refreshMacInputLatency revalidates it afterwards, off the audio thread.
 inline uint32_t macInputControlChanges(uint32_t changes, std::atomic<bool>& stable) {
-  if (changes & kMacInputLatencyChanged) stable.store(false, std::memory_order_release);
+  if (changes & kMacInputLatencyChanged) stable.store(false, std::memory_order_seq_cst);
   return changes & ~kMacInputLatencyChanged;
 }
 
@@ -148,6 +149,21 @@ struct MacInputLatency {
   uint32_t bufferFrames = 0;
   bool reported = false;
 };
+
+// A HAL notification can repeat an unchanged latency (notably when another
+// AUHAL client starts on the same USB device). Revalidate the immutable result
+// off the audio thread; a changed/unreadable value stays untrusted until it matches the opened value again.
+// Buffer size is independent telemetry, not first-sample placement latency.
+template <class Read>
+void refreshMacInputLatency(const MacInputLatency& opened, std::atomic<bool>& stable,
+                            const std::atomic<uint64_t>& revision, Read read) {
+  const auto before = revision.load(std::memory_order_seq_cst);
+  const auto current = read();
+  const bool matches = opened.reported && current.reported && opened.frames == current.frames;
+  stable.store(matches, std::memory_order_seq_cst);
+  if (revision.load(std::memory_order_seq_cst) != before)
+    stable.store(false, std::memory_order_seq_cst);
+}
 
 // Control-thread helper. Every term is required, including a reported zero.
 // Device/safety properties are nominal-device-rate frames. Stream latency is
