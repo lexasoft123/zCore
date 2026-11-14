@@ -2,6 +2,7 @@
 #pragma once
 
 #include <zcore/routing/audio_source.h>
+#include <zcore/routing/sample_clock.h>
 #include <array>
 
 namespace zcore::routing {
@@ -31,6 +32,7 @@ struct AudioHistoryReadSnapshot {
         absentSampleReads{};
     // Host-clock phase steps with an authoritative continuous sample counter.
     uint64_t maximumVerifiedClockStepNs{}, verifiedClockSteps{};
+    uint64_t phaseCorrections{}, correctedSamples{}, rejectedIntervals{};
 };
 
 struct AudioHistoryStatus {
@@ -39,6 +41,7 @@ struct AudioHistoryStatus {
     // Effective clock anchor, which can differ from the reported callback time.
     uint64_t lastHostNs, callbacks, discontinuities;
     double measuredRate;
+    uint64_t phaseCorrections{}, correctedSamples{}, rejectedIntervals{};
 };
 
 // A fixed logical channel layout, one serial producer and independent readers.
@@ -52,7 +55,9 @@ struct AudioHistoryStatus {
 // conceal absent source frames. Equal-rate aligned reads use the direct path.
 // Past host times use retained callback clock intervals, rather than a newer
 // rate estimate. Stable intervals coalesce only within timestamp precision.
-// Only authoritative continuous source counters may replace an otherwise unusable
+// Small unverified timestamp phase steps use a bounded fractional slope across
+// one closed interval (SampleClockPhaseConfig); raw host endpoints are retained.
+// Authoritative continuous source counters may replace an otherwise unusable
 // reported interval with the current measured-rate interval. Correction is bounded
 // at two milliseconds cumulatively; sustained unsupported clocks are not relabeled
 // as nominal. Missing source frames still reset the generation and are never hidden.
@@ -67,6 +72,8 @@ class AudioHistory final : public AudioSource {
     // pins its cutoff to the source format while positions follow its clock.
     AudioHistory(uint32_t channels, uint32_t capacityFrames, ResamplingFilter filter,
                  bool readDiagnostics = false);
+    AudioHistory(uint32_t channels, uint32_t capacityFrames, ResamplingFilter filter,
+                 bool readDiagnostics, SampleClockPhaseConfig phaseConfig);
     ~AudioHistory();
     AudioHistory(const AudioHistory&) = delete;
     AudioHistory& operator=(const AudioHistory&) = delete;

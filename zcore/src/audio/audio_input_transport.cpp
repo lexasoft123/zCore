@@ -71,6 +71,7 @@ bool AudioInputRing::peek(AudioInputBlockView& out, double sampleRate) {
     return false;
   AudioInputRingSlot& slot = impl_->slots[consumer % state.slotCount];
   out.capture = slot.capture;
+  out.sourcePosition = slot.sourcePosition;
   out.sequence = slot.sequence;
   out.sampleHostTimeNs = slot.sampleHostTimeNs;
   out.callbackHostTimeNs = slot.callbackHostTimeNs;

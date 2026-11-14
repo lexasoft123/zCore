@@ -1,4 +1,5 @@
-#pragma once
+#ifndef SINGZ_AUDIO_HOST_MACOS_HELPERS_H
+#define SINGZ_AUDIO_HOST_MACOS_HELPERS_H
 
 #include <cmath>
 #include <cstddef>
@@ -10,6 +11,105 @@
 #include <zcore/device/audio_host.h>
 
 namespace singz::detail {
+
+inline constexpr uint32_t kMacAudioHostAliveChanged = 1u << 0;
+inline constexpr uint32_t kMacAudioHostFormatChanged = 1u << 1;
+inline constexpr uint32_t kMacAudioHostBufferChanged = 1u << 2;
+
+// Immutable opening facts, queried only on the ordinary listener/control queue.
+// Stream order/identity, both physical and virtual formats, and per-buffer
+// channel counts matter; the shared device buffer period deliberately does not.
+struct MacAudioHostStreamFormat {
+  double rate = 0;
+  uint32_t id = 0, flags = 0, bytesPerPacket = 0, framesPerPacket = 0;
+  uint32_t bytesPerFrame = 0, channels = 0, bits = 0;
+  bool operator==(const MacAudioHostStreamFormat&) const = default;
+};
+struct MacAudioHostStreamFacts {
+  uint32_t identity = 0;
+  MacAudioHostStreamFormat physical, virtualFormat;
+  bool operator==(const MacAudioHostStreamFacts&) const = default;
+};
+struct MacAudioHostDeviceFacts {
+  uint32_t identity = 0;
+  double rate = 0;
+  std::vector<uint32_t> inputChannels, outputChannels;
+  std::vector<MacAudioHostStreamFacts> inputStreams, outputStreams;
+  bool operator==(const MacAudioHostDeviceFacts&) const = default;
+};
+
+constexpr bool macAudioHostUsesScope(bool hasInput, bool inputScope) noexcept {
+  return !inputScope || hasInput;
+}
+
+// Notification selectors only decide whether to query. Latch solely on a real
+// difference or an unreadable/removed device, including an AudioObjectID fence.
+inline uint32_t macAudioHostControlChange(
+    const MacAudioHostDeviceFacts& opened,
+    const MacAudioHostDeviceFacts& observed, bool alive, bool readable, bool hasInput = true) noexcept {
+  if (!alive || opened.identity != observed.identity) return kMacAudioHostAliveChanged;
+  const bool same = opened.rate == observed.rate &&
+      opened.outputChannels == observed.outputChannels && opened.outputStreams == observed.outputStreams &&
+      (!macAudioHostUsesScope(hasInput, true) ||
+       (opened.inputChannels == observed.inputChannels && opened.inputStreams == observed.inputStreams));
+  return !readable || !same ? kMacAudioHostFormatChanged : 0u;
+}
+
+enum class MacAudioHostIdentity { Present, Absent, Unknown };
+struct MacAudioHostRouteObservation {
+  MacAudioHostDeviceFacts facts;
+  MacAudioHostIdentity identity = MacAudioHostIdentity::Unknown;
+  bool readable = false;
+  bool retry = false;
+};
+struct MacAudioHostRouteCheck {
+  uint32_t changes = 0;
+  uint32_t warnings = AudioBufferWarningNone;
+};
+
+// Two immediate attempts at most, never a sleep or a callback operation.
+// Unknown identity is not evidence of removal. Still compare readable stream
+// facts, and fail closed for persistent format-read failures.
+template <class Read>
+MacAudioHostRouteCheck checkMacAudioHostRoute(
+    const MacAudioHostDeviceFacts& opened, bool hasInput, Read&& read) {
+  auto observed = read();
+  if (observed.identity != MacAudioHostIdentity::Absent &&
+      (observed.retry || !observed.readable || observed.identity == MacAudioHostIdentity::Unknown))
+    observed = read();
+  if (observed.identity == MacAudioHostIdentity::Absent)
+    return {kMacAudioHostAliveChanged, AudioBufferWarningNone};
+  // Partial format reads carry no new object identity. An unknown lookup or
+  // an unfilled facts object must not be mistaken for a confirmed replacement.
+  if (!observed.readable || observed.identity == MacAudioHostIdentity::Unknown)
+    observed.facts.identity = opened.identity;
+  return {macAudioHostControlChange(opened, observed.facts, true, observed.readable, hasInput),
+          observed.identity == MacAudioHostIdentity::Unknown || observed.retry
+              ? AudioBufferWarningReadFailed : AudioBufferWarningNone};
+}
+
+template <class Read>
+bool readMacAudioHostFactsWithRetry(Read&& read) {
+  return read() || read();
+}
+
+// A destroyed stream cannot retain its registration. Genuine removal failures
+// on live objects must still retain the copied block/queue for safety.
+constexpr bool macAudioHostListenerRemoved(bool removed, bool streamObject, bool objectGone) noexcept {
+  return removed || (streamObject && objectGone);
+}
+
+// Buffer-only notifications must neither query HAL configuration nor latch a
+// route change. Keep the selector dispatch at the same tested control seam.
+template <class Inspect>
+uint32_t macAudioHostControlNotification(bool configurationNotification,
+                                        Inspect&& inspect) {
+  return configurationNotification ? inspect() : 0u;
+}
+
+constexpr bool macAudioHostBufferExceedsMaximum(uint32_t frames, uint32_t maximum) noexcept {
+  return frames > maximum;
+}
 
 // The AUHAL render callback uses this exact predicate before its only
 // AudioUnitRender call. Keeping it trivial and testable makes the output-only
@@ -161,3 +261,5 @@ inline bool checkedAudioHostBufferRange(double minimum, double maximum,
 }
 
 }  // namespace singz::detail
+
+#endif  // SINGZ_AUDIO_HOST_MACOS_HELPERS_H

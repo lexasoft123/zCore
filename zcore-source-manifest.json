@@ -18,6 +18,8 @@
     "cmake/TestZcoreRealtimePolicy.cmake",
     "tests/native/audio_host_ios_link_smoke.cpp",
     "tests/native/audio_host_linux_tests.cpp",
+    "tests/native/audio_input_render_tests.cpp",
+    "tests/native/audio_monitor_buffer_tests.cpp",
     "tests/native/ffmpeg_decoder_status_tests.cpp",
     "tests/native/mp3_decoder_status_tests.cpp",
     "tests/native/utf8_path_tests.cpp",
@@ -85,6 +87,7 @@
     "third_party/native/flac/src/stream_encoder.c",
     "third_party/native/flac/src/stream_encoder_framing.c",
     "third_party/native/flac/src/window.c",
+    "tools/audio-host-buffer-probe.cpp",
     "zcore/README.md",
     "zcore/build-apple-audio-host-smoke.sh",
     "zcore/include/zcore/audio/audio_input_convert.h",
@@ -97,6 +100,7 @@
     "zcore/include/zcore/base/file_compat.h",
     "zcore/include/zcore/base/progress.h",
     "zcore/include/zcore/base/utf8_file.h",
+    "zcore/include/zcore/device/audio_buffer.h",
     "zcore/include/zcore/device/audio_host.h",
     "zcore/include/zcore/device/audio_host_callback.h",
     "zcore/include/zcore/device/audio_host_fake.h",
@@ -148,9 +152,13 @@
     "zcore/platform/linux/audio_host_linux.cpp",
     "zcore/platform/linux/audio_input_linux.cpp",
     "zcore/platform/linux/audio_input_wake_linux.cpp",
+    "zcore/platform/macos/audio_device_macos_buffer.h",
+    "zcore/platform/macos/audio_device_macos_buffer_properties.h",
     "zcore/platform/macos/audio_host_macos.cpp",
     "zcore/platform/macos/audio_host_macos_helpers.h",
     "zcore/platform/macos/audio_input_macos.cpp",
+    "zcore/platform/macos/audio_input_macos_latency.h",
+    "zcore/platform/macos/audio_input_macos_render.h",
     "zcore/platform/macos/audio_input_wake_macos.cpp",
     "zcore/platform/unsupported/audio_host_unsupported.cpp",
     "zcore/platform/windows/audio_host_asio.cpp",
@@ -170,6 +178,7 @@
     "zcore/src/audio/audio_input_transport.cpp",
     "zcore/src/audio/audio_input_transport_callback.cpp",
     "zcore/src/audio/audio_input_transport_internal.h",
+    "zcore/src/device/audio_buffer_ledger.cpp",
     "zcore/src/device/audio_host.cpp",
     "zcore/src/device/audio_host_callback.cpp",
     "zcore/src/device/audio_host_fifo.cpp",
@@ -300,7 +309,8 @@
       "zcore/platform/ios/audio_host_ios_helpers.cpp",
       "zcore/platform/ios/audio_host_ios_callback.cpp",
       "zcore/platform/ios/audio_host_ios_callback.h",
-      "zcore/platform/ios/audio_host_ios_session_signals.h"
+      "zcore/platform/ios/audio_host_ios_session_signals.h",
+      "zcore/src/device/audio_buffer_ledger.cpp"
     ],
     "zcore_media": [
       "zcore/src/media/owned_file_descriptor.cpp",
@@ -420,6 +430,9 @@
     ],
     "importer": [
       "scripts/test-import-zcore.py"
+    ],
+    "audioMonitorBuffers": [
+      "tests/native/audio_monitor_buffer_tests.cpp"
     ]
   },
   "upstreamUpdates": [

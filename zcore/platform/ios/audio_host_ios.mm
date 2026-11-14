@@ -340,6 +340,9 @@ public:
                        void *renderContext) override {
     @autoreleasepool {
       stop();
+      if (config.maximumAcceptableBufferFrames != 0)
+        return {false, AudioHostError::Unsupported, AudioHostState::Unsupported, {}, {},
+                "Buffer negotiation ceilings are unsupported on this platform"};
       // A new open invocation is a new terminal-cause scope even when it
       // fails before RemoteIO reaches Open. Never attribute the previous
       // generation's retained route/interruption cause to this attempt.

@@ -12,6 +12,10 @@ namespace singz {
 using AudioInputPush = bool (*)(void*, const float*, uint32_t, uint64_t,
                                 uint64_t, AudioInputTimestampQuality) noexcept;
 
+// Optional replacement push preserves the legacy backend/open callback ABI.
+using AudioInputPositionPush = bool (*)(void*, const float*, uint32_t, uint64_t,
+    uint64_t, AudioInputTimestampQuality, AudioInputSourcePosition) noexcept;
+
 inline constexpr uint32_t kAudioInputBusMaxChannels = 64;
 
 struct AudioInputBusConfig {
@@ -60,6 +64,14 @@ class AudioInputBackend {
   virtual bool suspendPrepared() { return false; }
   // Lock-free backend flags are rendered into a message here, off RT.
   virtual bool takeFailure(std::string& error) = 0;
+  // Control-domain advisory stop outcomes, independently of capture failures.
+  virtual uint32_t bufferWarnings() const noexcept { return AudioBufferWarningNone; }
+  // Cumulative for the current take, atomically readable from the control domain.
+  // start() resets this before callbacks begin; stop() preserves the final value.
+  virtual uint64_t renderSliceDrops() const noexcept { return 0; }
+  // Set on control after open, before start; a supporting backend calls this
+  // instead of the legacy push, with exactly the same PCM and host times.
+  virtual void setPositionPush(AudioInputPositionPush) {}
 };
 
 std::unique_ptr<AudioInputBackend> createPlatformAudioInputBackend();

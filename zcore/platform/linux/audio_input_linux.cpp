@@ -20,6 +20,9 @@ class AlsaInput final : public AudioInputBackend {
   AudioInputResult open(const AudioInputConfig& config, AudioInputPush push,
                         void* context) override {
     stop();
+    if (config.requestedBufferFrames != 0 || config.maximumAcceptableBufferFrames != 0)
+      return AudioInputResult::failure(AudioInputState::Unsupported,
+          "Input buffer-size requests are unsupported on this platform", config.channel);
     if (!push) return fail("Capture callback is missing", config.channel);
 #if defined(SINGZ_CORE_TESTS)
     if (!testPcm_.empty()) return openMono(config, push, context, testPcm_, testChannels_);

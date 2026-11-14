@@ -11,6 +11,13 @@ bool AudioInputRingProducer::push(
     const float* mono, uint32_t frames, uint64_t sampleHostTimeNs,
     uint64_t callbackHostTimeNs,
     AudioInputTimestampQuality timestampQuality) const noexcept {
+  return pushWithPosition(mono, frames, sampleHostTimeNs, callbackHostTimeNs,
+                          timestampQuality, {});
+}
+bool AudioInputRingProducer::pushWithPosition(
+    const float* mono, uint32_t frames, uint64_t sampleHostTimeNs,
+    uint64_t callbackHostTimeNs, AudioInputTimestampQuality timestampQuality,
+    AudioInputSourcePosition sourcePosition) const noexcept {
   AudioInputRingCallbackState* state = state_;
   if (!state) return false;
   const uint64_t attemptSequence = state->nextSequence++;
@@ -44,6 +51,7 @@ bool AudioInputRingProducer::push(
   slot.sampleHostTimeNs = sampleHostTimeNs;
   slot.callbackHostTimeNs = callbackHostTimeNs;
   slot.timestampQuality = timestampQuality;
+  slot.sourcePosition = sourcePosition;
   slot.capture.clockDomainId = state->clockDomainId;
   slot.capture.streamGeneration = state->streamGeneration;
   slot.capture.sequence = attemptSequence;

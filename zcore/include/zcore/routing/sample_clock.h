@@ -5,6 +5,17 @@
 #include <memory>
 
 namespace zcore::routing {
+// Opt in on control (for example {2, 8}); default construction preserves
+// legacy unverified interval rejection. Zero disables phase tolerance.
+// The effective sample bound is min(maximumStepSamples, nominalRate * 0.0001).
+// A rolling one-second budget prevents a persistently wrong clock being hidden.
+struct SampleClockPhaseConfig {
+    double maximumStepSamples{0};
+    uint32_t maximumCorrectionsPerSecond{0};
+};
+struct SampleClockPhaseDiagnostics {
+    uint64_t phaseCorrections{}, correctedSamples{}, rejectedIntervals{};
+};
 struct SampleClockMapping {
     bool valid{false};
     uint64_t frame{0};
@@ -23,9 +34,13 @@ class SampleClockHistory {
         uint64_t begin{0}, end{0};
     };
     explicit SampleClockHistory(uint32_t capacity);
+    SampleClockHistory(uint32_t capacity, SampleClockPhaseConfig phaseConfig);
+    SampleClockPhaseDiagnostics phaseDiagnostics() const noexcept;
     ~SampleClockHistory();
     SampleClockHistory(const SampleClockHistory&) = delete;
     SampleClockHistory& operator=(const SampleClockHistory&) = delete;
+    // Small unverified phase steps use the prepared phaseConfig's bounded closed
+    // interval slope; they never change PCM storage or extrapolate that slope.
     // Set only when an authoritative source sample counter proves contiguous
     // frames since the preceding anchor. It is not inferred from receipt time.
     // Valid rates permit only those continuous intervals to replace an otherwise
@@ -36,6 +51,8 @@ class SampleClockHistory {
                 double nominalRate = 0, double fallbackRate = 0) noexcept;
     // Effective timestamp of the newest anchor, including a verified correction.
     uint64_t lastHostNs() const noexcept;
+    // Starts a new continuity generation and clears its rolling correction budget.
+    // Cumulative diagnostic counters are retained.
     void reset() noexcept;
     Snapshot snapshot() const noexcept;
     // fractionNs retains sub-nanosecond output-grid positions. Only the newest

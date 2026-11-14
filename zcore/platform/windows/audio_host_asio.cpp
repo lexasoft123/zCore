@@ -162,6 +162,9 @@ class AsioAudioHostBackend final : public AudioHostBackend {
       return fail(AudioHostError::InvalidState, AudioHostState::Running,
                   "Stop the ASIO stream before opening another driver");
     stop();
+    if (config.maximumAcceptableBufferFrames != 0)
+      return {false, AudioHostError::Unsupported, AudioHostState::Unsupported, {}, {},
+              "Buffer negotiation ceilings are unsupported on this platform"};
     format_ = {};
     latency_ = {};
     const AsioDriverProbe availability = driver_->probe();

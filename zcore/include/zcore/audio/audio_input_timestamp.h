@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <zcore/audio/capture_block.h>
 
 #if defined(__GNUC__) || defined(__clang__)
 #define SINGZ_ZCORE_CALLBACK_LOCAL __attribute__((visibility("hidden")))
@@ -10,6 +11,10 @@
 #endif
 
 namespace singz {
+
+// AUHAL/other provider sample-counter validity, without host-time inference.
+SINGZ_ZCORE_CALLBACK_LOCAL AudioInputSourcePosition resolveAudioInputSourcePosition(
+    bool sampleTimeValid, double sampleFrame) noexcept;
 
 struct AudioInputTimestampProjection {
   uint64_t sampleHostTimeNs = 0;
