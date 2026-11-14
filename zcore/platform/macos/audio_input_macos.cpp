@@ -25,6 +25,7 @@
 #include <vector>
 
 #include <zcore/audio/audio_input_timestamp.h>
+#include "audio_input_macos_latency.h"
 
 namespace singz {
 namespace {
@@ -33,9 +34,11 @@ constexpr uint32_t kMaximumFrames = 16384;
 constexpr uint32_t kDeviceAliveChanged = 1u << 0;
 constexpr uint32_t kSampleRateChanged = 1u << 1;
 constexpr uint32_t kStreamConfigurationChanged = 1u << 2;
+constexpr uint32_t kLatencyChanged = detail::kMacInputLatencyChanged;
 
 struct DeviceListenerContext {
   std::atomic<uint32_t> pendingChanges{0};
+  std::atomic<bool> latencyStable{true};
 };
 
 struct RetiredDeviceListener {
@@ -75,6 +78,40 @@ bool getProperty(AudioObjectID object, AudioObjectPropertyAddress property, T& v
   UInt32 size = sizeof(value);
   return AudioObjectGetPropertyData(object, &property, 0, nullptr, &size, &value) == noErr &&
          size == sizeof(value);
+}
+
+std::optional<uint32_t> frameProperty(AudioObjectID object,
+                                     AudioObjectPropertySelector selector,
+                                     AudioObjectPropertyScope scope) {
+  UInt32 value = 0;
+  if (!getProperty(object, address(selector, scope), value)) return std::nullopt;
+  return value;
+}
+
+// Select the stream containing the physical input channel, rather than using
+// the first stream (multi-stream interfaces can have different latencies).
+AudioStreamID inputStream(AudioDeviceID device, uint32_t channel) {
+  const auto property = address(kAudioDevicePropertyStreams, kAudioDevicePropertyScopeInput);
+  UInt32 size = 0;
+  if (AudioObjectGetPropertyDataSize(device, &property, 0, nullptr, &size) != noErr ||
+      !size || size % sizeof(AudioStreamID) || size > 4096 * sizeof(AudioStreamID))
+    return kAudioObjectUnknown;
+  std::vector<AudioStreamID> streams(size / sizeof(AudioStreamID));
+  const UInt32 capacity = size;
+  if (AudioObjectGetPropertyData(device, &property, 0, nullptr, &size, streams.data()) != noErr ||
+      size > capacity || size % sizeof(AudioStreamID)) return kAudioObjectUnknown;
+  streams.resize(size / sizeof(AudioStreamID));
+  for (const auto stream : streams) {
+    UInt32 first = 0;
+    AudioStreamBasicDescription format{};
+    if (!getProperty(stream, address(kAudioStreamPropertyStartingChannel,
+                                     kAudioObjectPropertyScopeGlobal), first) || !first ||
+        !getProperty(stream, address(kAudioStreamPropertyVirtualFormat,
+                                     kAudioObjectPropertyScopeGlobal), format)) continue;
+    if (channel >= first - 1 && uint64_t{channel} < uint64_t{first - 1} + format.mChannelsPerFrame)
+      return stream;
+  }
+  return kAudioObjectUnknown;
 }
 
 std::string cfString(CFStringRef value) {
@@ -262,6 +299,14 @@ class MacAudioInputBackend final : public AudioInputBackend {
     status = AudioUnitInitialize(unit_);
     if (status != noErr) return fail("initialize AUHAL", status, config.channel);
     initialized_ = true;
+    propertySize = sizeof(format);
+    status = AudioUnitGetProperty(unit_, kAudioUnitProperty_StreamFormat,
+                                  kAudioUnitScope_Output, 1, &format, &propertySize);
+    if (status != noErr || propertySize != sizeof(format) ||
+        !std::isfinite(format.mSampleRate) || format.mSampleRate <= 0)
+      return failMessage("AUHAL negotiated sample rate is unavailable", config.channel);
+    deviceSampleRate_ = nominalRate;
+    sampleRate_ = format.mSampleRate;
     listenerContext_ = std::make_shared<DeviceListenerContext>();
     listenerQueue_ = dispatch_queue_create("com.lexasoft.singz.audio-input-device", nullptr);
     if (!listenerQueue_)
@@ -277,7 +322,10 @@ class MacAudioInputBackend final : public AudioInputBackend {
           changes |= kSampleRateChanged;
         else if (properties[i].mSelector == kAudioDevicePropertyStreamConfiguration)
           changes |= kStreamConfigurationChanged;
+        else
+          changes |= kLatencyChanged;
       }
+      (void)detail::macInputControlChanges(changes, listener->latencyStable);
       if (changes) listener->pendingChanges.fetch_or(changes, std::memory_order_release);
     });
     const AudioObjectPropertyAddress watched[] = {
@@ -288,11 +336,34 @@ class MacAudioInputBackend final : public AudioInputBackend {
       status = AudioObjectAddPropertyListenerBlock(selectedDevice_, &property,
                                                    listenerQueue_, listenerBlock_);
       if (status != noErr) return fail("watch AUHAL device", status, config.channel);
-      watchedProperties_.push_back(property);
+      watchedProperties_.push_back({selectedDevice_, property});
     }
-    sampleRate_ = nominalRate;
+    selectedStream_ = inputStream(selectedDevice_, channel_);
+    // These are optional driver properties. Missing queries/listeners disable
+    // reported compensation, but must not make an otherwise usable mic fail.
+    const AudioObjectPropertyAddress latencyProperties[] = {
+        address(kAudioDevicePropertyLatency, kAudioDevicePropertyScopeInput),
+        address(kAudioDevicePropertySafetyOffset, kAudioDevicePropertyScopeInput),
+        address(kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal),
+        address(kAudioDevicePropertyStreams, kAudioDevicePropertyScopeInput)};
+    latencyWatchable_ = true;
+    for (const auto& property : latencyProperties) {
+      if (AudioObjectAddPropertyListenerBlock(selectedDevice_, &property,
+                                               listenerQueue_, listenerBlock_) == noErr)
+        watchedProperties_.push_back({selectedDevice_, property});
+      else latencyWatchable_ = false;
+    }
+    for (const auto selector : {kAudioStreamPropertyLatency, kAudioStreamPropertyVirtualFormat,
+                                kAudioStreamPropertyPhysicalFormat}) {
+      const auto property = address(selector, kAudioObjectPropertyScopeGlobal);
+      if (selectedStream_ != kAudioObjectUnknown &&
+          AudioObjectAddPropertyListenerBlock(selectedStream_, &property,
+                                               listenerQueue_, listenerBlock_) == noErr)
+        watchedProperties_.push_back({selectedStream_, property});
+      else latencyWatchable_ = false;
+    }
     callbackFailure_.store(0, std::memory_order_relaxed);
-    return AudioInputResult::success(AudioInputState::Starting, sampleRate_, channel_);
+    return resultWithLatency(AudioInputState::Starting);
   }
 
   AudioInputResult start() override {
@@ -302,7 +373,7 @@ class MacAudioInputBackend final : public AudioInputBackend {
     const OSStatus status = AudioOutputUnitStart(unit_);
     if (status != noErr) return fail("start AUHAL", status, channel_);
     started_ = true;
-    return AudioInputResult::success(AudioInputState::Running, sampleRate_, channel_);
+    return resultWithLatency(AudioInputState::Running);
   }
 
   bool suspendPrepared() override {
@@ -315,8 +386,8 @@ class MacAudioInputBackend final : public AudioInputBackend {
   void stop() override {
     bool removedAll = true;
     if (selectedDevice_ != kAudioObjectUnknown && listenerContext_) {
-      for (const AudioObjectPropertyAddress& property : watchedProperties_) {
-        if (AudioObjectRemovePropertyListenerBlock(selectedDevice_, &property,
+      for (const auto& [object, property] : watchedProperties_) {
+        if (AudioObjectRemovePropertyListenerBlock(object, &property,
                                                    listenerQueue_, listenerBlock_) != noErr)
           removedAll = false;
       }
@@ -349,13 +420,15 @@ class MacAudioInputBackend final : public AudioInputBackend {
     push_ = nullptr;
     context_ = nullptr;
     selectedDevice_ = kAudioObjectUnknown;
+    selectedStream_ = kAudioObjectUnknown;
+    latencyWatchable_ = false;
   }
 
   bool takeFailure(std::string& error) override {
     const uint32_t changes = listenerContext_
-                                 ? listenerContext_->pendingChanges.exchange(
-                                       0, std::memory_order_acq_rel)
-                                 : 0;
+        ? detail::macInputControlChanges(listenerContext_->pendingChanges.exchange(
+              0, std::memory_order_acq_rel), listenerContext_->latencyStable)
+        : 0;
     if (changes & kDeviceAliveChanged) {
       UInt32 alive = 0;
       if (!getProperty(selectedDevice_,
@@ -372,7 +445,7 @@ class MacAudioInputBackend final : public AudioInputBackend {
                        address(kAudioDevicePropertyNominalSampleRate,
                                kAudioObjectPropertyScopeGlobal),
                        nominalRate) || !std::isfinite(nominalRate) || nominalRate <= 0 ||
-          nominalRate != sampleRate_) {
+          nominalRate != deviceSampleRate_) {
         error = "audio input sample rate changed; restart capture";
         return true;
       }
@@ -384,6 +457,9 @@ class MacAudioInputBackend final : public AudioInputBackend {
                   : "audio input stream configuration changed; restart capture";
       return true;
     }
+    // Latency/buffer and stream-format notifications only invalidate the
+    // opening latency snapshot in the listener. Benign shared-device changes
+    // must not interrupt a take. Existing route/rate failures above still do.
     const int32_t status = callbackFailure_.exchange(0, std::memory_order_acq_rel);
     if (!status) return false;
     error = status == kCallbackTooLarge
@@ -393,6 +469,30 @@ class MacAudioInputBackend final : public AudioInputBackend {
   }
 
  private:
+  AudioInputResult resultWithLatency(AudioInputState state) const {
+    auto result = AudioInputResult::success(state, sampleRate_, channel_);
+    result.inputLatencyStable = std::shared_ptr<const std::atomic<bool>>(
+        listenerContext_, &listenerContext_->latencyStable);
+    Float64 deviceRate = 0;
+    AudioStreamBasicDescription physicalFormat{};
+    if (!latencyWatchable_ ||
+        !getProperty(selectedDevice_, address(kAudioDevicePropertyNominalSampleRate,
+                                               kAudioObjectPropertyScopeGlobal), deviceRate) ||
+        !getProperty(selectedStream_, address(kAudioStreamPropertyPhysicalFormat,
+                                               kAudioObjectPropertyScopeGlobal), physicalFormat))
+      return result;
+    const auto latency = detail::macInputLatency(
+        frameProperty(selectedDevice_, kAudioDevicePropertyLatency, kAudioDevicePropertyScopeInput),
+        frameProperty(selectedDevice_, kAudioDevicePropertySafetyOffset, kAudioDevicePropertyScopeInput),
+        frameProperty(selectedStream_, kAudioStreamPropertyLatency, kAudioObjectPropertyScopeGlobal),
+        frameProperty(selectedDevice_, kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal),
+        deviceRate, sampleRate_, physicalFormat.mSampleRate);
+    result.inputLatencyFrames = latency.frames;
+    result.inputBufferFrames = latency.bufferFrames;
+    result.inputLatencySource = latency.reported ? "reported" : "unknown";
+    return result;
+  }
+
   static constexpr int32_t kCallbackTooLarge = std::numeric_limits<int32_t>::min();
 
   static OSStatus renderCallback(void* context, AudioUnitRenderActionFlags* flags,
@@ -451,7 +551,10 @@ class MacAudioInputBackend final : public AudioInputBackend {
   bool initialized_ = false;
   bool started_ = false;
   AudioDeviceID selectedDevice_ = kAudioObjectUnknown;
+  AudioStreamID selectedStream_ = kAudioObjectUnknown;
+  bool latencyWatchable_ = false;
   double sampleRate_ = 0;
+  double deviceSampleRate_ = 0;
   uint32_t channel_ = 0;
   double nsPerHostTick_ = 0;
   std::vector<float> renderBuffer_;
@@ -461,7 +564,7 @@ class MacAudioInputBackend final : public AudioInputBackend {
   std::shared_ptr<DeviceListenerContext> listenerContext_;
   dispatch_queue_t listenerQueue_ = nullptr;
   AudioObjectPropertyListenerBlock listenerBlock_ = nullptr;
-  std::vector<AudioObjectPropertyAddress> watchedProperties_;
+  std::vector<std::pair<AudioObjectID, AudioObjectPropertyAddress>> watchedProperties_;
 };
 
 }  // namespace

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <string>
@@ -73,6 +74,20 @@ struct AudioInputResult {
   std::string performanceMode;
   std::string inputPreset;
   std::string timestampSource;
+  // Input hardware/safety/stream delay and separate negotiated I/O buffer,
+  // both in capture-rate frames. Delay assumes a FIRST-SAMPLE timestamp (HAL
+  // mHostTime or the already buffer-adjusted CallbackEstimate). Never subtract
+  // the buffer again from those timestamps. A raw callback-entry timestamp
+  // needs its buffer duration removed first, before applying this delay.
+  // Unknown means at least one required property was unavailable; zero alone
+  // does not indicate whether the driver reported a delay. BoxInputCapture /
+  // box_routing_owner and non-macOS backends leave these fields unknown/zero.
+  uint32_t inputLatencyFrames = 0;
+  uint32_t inputBufferFrames = 0;
+  std::string inputLatencySource = "unknown";
+  // Optional live validity of the opening snapshot. Property notifications
+  // invalidate it without stopping capture; null leaves source authoritative.
+  std::shared_ptr<const std::atomic<bool>> inputLatencyStable;
 };
 
 struct AudioInputStats {
