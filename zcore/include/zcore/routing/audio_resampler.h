@@ -22,6 +22,8 @@ enum class ResamplePath : uint32_t {
     Invalid,
     Count
 };
+// Successful immutable table constructions; increments only on the control thread.
+uint64_t sincCoefficientTableConstructions() noexcept;
 struct ResampleDiagnosticsSnapshot {
     std::array<uint64_t, static_cast<size_t>(ResamplePath::Count)> blocks{};
     uint32_t lastPathMask{};
@@ -29,7 +31,7 @@ struct ResampleDiagnosticsSnapshot {
     double cutoff{}, sourceRate{}, outputRate{};
     // Tables are constructed once on control and remain immutable. There is
     // no runtime cache eviction, rebuild, or ratio-keyed mutable coefficient cache.
-    uint32_t preparedTables{2}, coefficientRebuilds{0};
+    uint64_t coefficientTableConstructions{0};
 };
 struct ResampleDiagnostics {
     std::array<std::atomic<uint64_t>, static_cast<size_t>(ResamplePath::Count)> blocks{};
@@ -43,6 +45,7 @@ struct ResampleDiagnostics {
     }
     ResampleDiagnosticsSnapshot snapshot() const noexcept {
         ResampleDiagnosticsSnapshot result;
+        result.coefficientTableConstructions = sincCoefficientTableConstructions();
         for (size_t index = 0; index < blocks.size(); ++index)
             result.blocks[index] = blocks[index].load(std::memory_order_relaxed);
         result.lastPathMask = lastPathMask.load(std::memory_order_relaxed);

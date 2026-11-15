@@ -1,11 +1,13 @@
 #include <zcore/routing/sinc_phase_table.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <numbers>
 #include <stdexcept>
 
 namespace zcore::routing {
 namespace {
+std::atomic<uint64_t> tableConstructions{0};
 constexpr double kBeta = 9;
 constexpr uint32_t kNodes = 5;
 
@@ -110,6 +112,10 @@ SincPhaseTable::SincPhaseTable(double cutoff, uint32_t cells) : cutoff_(cutoff),
                     static_cast<float>(coefficient);
             }
         }
+    tableConstructions.fetch_add(1, std::memory_order_relaxed);
+}
+uint64_t sincCoefficientTableConstructions() noexcept {
+    return tableConstructions.load(std::memory_order_relaxed);
 }
 
 // The reduced cutoff is written as AudioResampler derives it for an exact

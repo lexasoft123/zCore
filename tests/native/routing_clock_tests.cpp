@@ -1,3 +1,5 @@
+#include <thread>
+#include <zcore/routing/sinc_phase_table.h>
 #include <zcore/routing/audio_diagnostics.h>
 #include <zcore/routing/audio_history.h>
 #include <zcore/routing/audio_resampler.h>
@@ -634,6 +636,7 @@ void diagnosticPathsAndEnergy() {
     using namespace zcore::routing;
     AudioResampler reader;
     ResampleDiagnostics diagnostics;
+    const auto constructions = sincCoefficientTableConstructions();
     std::array<float, 256> samples{};
     std::array<float*, 1> planes{samples.data()};
     const auto provider =
@@ -656,8 +659,9 @@ void diagnosticPathsAndEnergy() {
     const auto snapshot = diagnostics.snapshot();
     for (size_t index = 0; index < snapshot.blocks.size(); ++index)
         CHECK(snapshot.blocks[index] > 0);
-    CHECK(snapshot.tableMisses > 0 && snapshot.coefficientRebuilds == 0 &&
-          snapshot.preparedTables == 2);
+    CHECK(snapshot.tableMisses > 0 && snapshot.coefficientTableConstructions == constructions);
+    SincPhaseTable independentlyPrepared(SincKernel::kCutoff);
+    CHECK(sincCoefficientTableConstructions() == constructions + 1);
     AudioEnergyMeter energy;
     for (uint32_t frame = 0; frame < 256; ++frame)
         samples[frame] = .2f * std::sin(2 * 3.14159265358979323846 * 16000 * frame / 48000);
@@ -671,8 +675,40 @@ void diagnosticPathsAndEnergy() {
     CHECK(low.rms > .13 && low.highBandRms < .002 && low.blocks == 2);
 }
 
+void energySnapshotsAreWholeBlocks() {
+    using namespace zcore::routing;
+    AudioEnergyMeter meter;
+    std::array<float, 64> quiet{};
+    std::array<float, 128> loud{};
+    quiet.fill(.125f);
+    loud.fill(.5f);
+    const std::array<float*, 1> quietPlane{quiet.data()}, loudPlane{loud.data()};
+    std::atomic<unsigned> done{0};
+    std::atomic<bool> start{false};
+    const auto observe = [&](auto planes, uint32_t frames) {
+        while (!start.load(std::memory_order_acquire))
+            std::this_thread::yield();
+        for (unsigned index = 0; index < 10000; ++index)
+            meter.observe(planes, frames, 48000);
+        done.fetch_add(1, std::memory_order_release);
+    };
+    std::thread first(observe, quietPlane, 64), second(observe, loudPlane, 128);
+    start.store(true, std::memory_order_release);
+    while (done.load(std::memory_order_acquire) != 2) {
+        const auto result = meter.snapshot();
+        if (!result.available)
+            continue;
+        CHECK((result.frames == 64 && result.rms == .125) ||
+              (result.frames == 128 && result.rms == .5));
+    }
+    first.join();
+    second.join();
+    CHECK(meter.snapshot().available);
+}
+
 int main() {
     diagnosticPathsAndEnergy();
+    energySnapshotsAreWholeBlocks();
     sincLookupMatchesOriginalFormula();
     bulkSincMatchesScalar();
     driftingCaptureAndOutput();
