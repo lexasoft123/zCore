@@ -1,3 +1,4 @@
+#include <zcore/routing/audio_diagnostics.h>
 #include <zcore/routing/audio_history.h>
 #include <zcore/routing/audio_resampler.h>
 #include <zcore/routing/sample_clock.h>
@@ -629,7 +630,49 @@ void cachedFirDispatch() {
         mono.maximumError, mono.snr, stereo.maximumError, stereo.snr);
 }
 }
+void diagnosticPathsAndEnergy() {
+    using namespace zcore::routing;
+    AudioResampler reader;
+    ResampleDiagnostics diagnostics;
+    std::array<float, 256> samples{};
+    std::array<float*, 1> planes{samples.data()};
+    const auto provider =
+        +[](const void*, uint64_t, std::span<float> values) noexcept -> ResampleFrame {
+        for (auto& value : values)
+            value = .25f;
+        return {true, uint32_t(values.size())};
+    };
+    const auto render = [&](long double fraction, double source, uint32_t frames) {
+        CHECK(reader.read({512, fraction, source, 48000, false, 0, &diagnostics}, {planes, 256},
+                          frames, provider, nullptr) == 0);
+    };
+    render(0, 48000, 256);
+    render(.5L, 48000, 256);
+    render(.37L, 48001, 256);
+    render(.37L, 48001, 16);
+    render(.37L, 96000, 256);
+    CHECK(reader.read({512, 0, 0, 48000, false, 0, &diagnostics}, {planes, 256}, 256, provider,
+                      nullptr) == 256);
+    const auto snapshot = diagnostics.snapshot();
+    for (size_t index = 0; index < snapshot.blocks.size(); ++index)
+        CHECK(snapshot.blocks[index] > 0);
+    CHECK(snapshot.tableMisses > 0 && snapshot.coefficientRebuilds == 0 &&
+          snapshot.preparedTables == 2);
+    AudioEnergyMeter energy;
+    for (uint32_t frame = 0; frame < 256; ++frame)
+        samples[frame] = .2f * std::sin(2 * 3.14159265358979323846 * 16000 * frame / 48000);
+    energy.observe(planes, 256, 48000);
+    const auto high = energy.snapshot();
+    CHECK(high.rms > .13 && high.highBandRms > .13 && high.blocks == 1);
+    for (uint32_t frame = 0; frame < 256; ++frame)
+        samples[frame] = .2f * std::sin(2 * 3.14159265358979323846 * 1000 * frame / 48000);
+    energy.observe(planes, 256, 48000);
+    const auto low = energy.snapshot();
+    CHECK(low.rms > .13 && low.highBandRms < .002 && low.blocks == 2);
+}
+
 int main() {
+    diagnosticPathsAndEnergy();
     sincLookupMatchesOriginalFormula();
     bulkSincMatchesScalar();
     driftingCaptureAndOutput();

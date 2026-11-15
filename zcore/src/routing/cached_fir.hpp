@@ -256,11 +256,15 @@ class CachedFir {
             return true;
         };
         uint32_t missing = 0;
+        uint32_t pathMask = 0;
         for (uint32_t frame = 0; frame < frames; ++frame) {
             const auto& target = targets[frame];
             const auto begin = static_cast<uint32_t>(target.center - radius - first);
-            if (phases && readPhase(frame, target.fraction, begin))
+            if (phases && readPhase(frame, target.fraction, begin)) {
+                pathMask |= resamplePath(ResamplePath::PhaseTable);
                 continue;
+            }
+            pathMask |= resamplePath(ResamplePath::CachedExact);
             double normalization = fixedPhase && allAvailable ? fixedNormalization : 0;
             bool complete = true, available = true;
             const auto scanCoverage = [&] {
@@ -327,6 +331,8 @@ class CachedFir {
                         : 0;
             }
         }
+        if (read.diagnostics)
+            read.diagnostics->record(pathMask);
         return missing;
     }
     template <class Provider>

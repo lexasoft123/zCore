@@ -43,6 +43,15 @@ AudioResampler::AudioResampler(ResamplingFilter filter)
 uint32_t AudioResampler::read(ResamplePosition read, ResampleOutput output, uint32_t frames,
                               ReadFrame provider, const void* context,
                               std::span<uint8_t> availableFrames) const noexcept {
+    uint32_t pathMask = 0;
+    struct Publish {
+        ResampleDiagnostics* diagnostics;
+        uint32_t& mask;
+        ~Publish() {
+            if (diagnostics)
+                diagnostics->record(mask ? mask : resamplePath(ResamplePath::Invalid));
+        }
+    } publish{read.diagnostics, pathMask};
     silence(output, frames);
     std::fill_n(availableFrames.begin(), std::min<size_t>(frames, availableFrames.size()),
                 uint8_t{0});
@@ -71,6 +80,14 @@ uint32_t AudioResampler::read(ResamplePosition read, ResampleOutput output, uint
     const auto filterRate =
         minimum_ && read.nominalSourceRate ? read.nominalSourceRate : read.sourceRate;
     const auto cutoff = SincKernel::kCutoff * std::min(1.0, read.outputRate / filterRate);
+    if (read.diagnostics) {
+        read.diagnostics->cutoffBits.store(std::bit_cast<uint64_t>(cutoff),
+                                           std::memory_order_relaxed);
+        read.diagnostics->sourceBits.store(std::bit_cast<uint64_t>(read.sourceRate),
+                                           std::memory_order_relaxed);
+        read.diagnostics->outputBits.store(std::bit_cast<uint64_t>(read.outputRate),
+                                           std::memory_order_relaxed);
+    }
     const bool sameRate = std::abs(read.sourceRate - read.outputRate) <= read.outputRate * 2e-9;
     const auto getFrame = [&](uint64_t position, std::span<float> values) {
         const auto result = provider(context, position, values.first(output.channels.size()));
@@ -103,9 +120,11 @@ uint32_t AudioResampler::read(ResamplePosition read, ResampleOutput output, uint
                 constant = whole == integral + index &&
                            std::abs(static_cast<double>(offset - whole) - fraction) <= 1e-12;
             }
-            if (constant)
+            if (constant) {
+                pathMask = resamplePath(ResamplePath::Convolution);
                 return convolution_->read(center, fraction, output, frames, *linear_, getFrame,
                                           availableFrames);
+            }
         }
     }
 
@@ -113,13 +132,20 @@ uint32_t AudioResampler::read(ResamplePosition read, ResampleOutput output, uint
     // reader preserves its phase/rate exactly and declines direct-copy frames.
     if (linear_) {
         const auto* const table = phases_->find(cutoff);
+        if (!table && read.diagnostics)
+            read.diagnostics->tableMisses.fetch_add(1, std::memory_order_relaxed);
         if (const auto cached = CachedFir::read(read, output, frames, *linear_, cutoff, getFrame,
-                                                availableFrames, table))
+                                                availableFrames, table)) {
+            pathMask = 0; // CachedFir publishes the paths it actually evaluated.
+            publish.diagnostics = nullptr;
             return *cached;
+        }
         if (output.channels.size() <= 2)
             if (const auto cached = CachedFir::readWindow<512, 2, false>(
-                    read, output, frames, *linear_, cutoff, getFrame, availableFrames, table))
+                    read, output, frames, *linear_, cutoff, getFrame, availableFrames, table)) {
+                publish.diagnostics = nullptr;
                 return *cached;
+            }
     }
 
     // A 32-frame output tile needs 16 KiB of double accumulators at 64
@@ -157,6 +183,7 @@ uint32_t AudioResampler::read(ResamplePosition read, ResampleOutput output, uint
             target.direct =
                 linear_ && sameRate && (target.fraction < 0.0002 || target.fraction > 0.9998);
             if (target.direct) {
+                pathMask |= resamplePath(ResamplePath::Direct);
                 if (target.fraction > 0.9998)
                     ++target.center;
                 const auto value = getFrame(target.center, source);
@@ -166,6 +193,7 @@ uint32_t AudioResampler::read(ResamplePosition read, ResampleOutput output, uint
                     for (size_t channel = 0; channel < count; ++channel)
                         output.channels[channel][(begin + index) * output.stride] = source[channel];
             } else if (target.center >= past && target.center <= UINT64_MAX - future) {
+                pathMask |= resamplePath(ResamplePath::TiledExact);
                 target.complete = true;
                 first = std::min(first, target.center - past);
                 last = std::max(last, target.center + future);
