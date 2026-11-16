@@ -1159,6 +1159,9 @@ class WasapiAudioHostBackend final : public AudioHostBackend {
   AudioHostResult open(const AudioHostConfig& config, AudioHostRender render,
                        void* renderContext) override {
     stop();
+    if (config.maximumAcceptableBufferFrames != 0)
+      return {false, AudioHostError::Unsupported, AudioHostState::Unsupported, {}, {},
+              "Buffer negotiation ceilings are unsupported on this platform"};
     const uint64_t previousRouteGeneration = routeContext_
         ? routeContext_->generation() : routeGenerationSeed_;
     routeContext_.reset();

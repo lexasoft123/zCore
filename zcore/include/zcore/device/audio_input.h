@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <string>
@@ -8,6 +9,7 @@
 #include <vector>
 
 #include <zcore/audio/audio_input_transport.h>
+#include <zcore/device/audio_buffer.h>
 
 namespace singz {
 
@@ -24,6 +26,22 @@ struct AudioInputConfig {
   std::string deviceUid;
   uint32_t channel = 0;
   uint32_t ringBlocks = 32;
+  // Zero leaves the device unchanged. macOS clamps to the legal device range
+  // and reports the read-back value in inputBufferFrames. This is a device-wide
+  // property shared with other apps; restoration is deferred until the last
+  // in-process input/output lease really closes and skipped after an external
+  // change. Retained-prepared capture keeps its lease until stop(false)/destruction.
+  // Other platforms reject nonzero requests with Unsupported.
+  uint32_t requestedBufferFrames = 0;
+  // macOS requires this explicit opt-in for a nonzero buffer request. A
+  // private aggregate would need a separately owned input/output route;
+  // ordinary recording leaves physical-device settings alone by default.
+  bool allowSharedDeviceBufferChange = false;
+  // Optional achieved-size ceiling, zero = none. Oversize negotiation fails
+  // and attempts checked rollback (an external change may prevent it). Callers
+  // must still verify inputBufferFrames and soft warnings. Unlike
+  // LoopZ's persistent device setting, this is an opt-in per-lifetime request.
+  uint32_t maximumAcceptableBufferFrames = 0;
 };
 
 enum class AudioInputState {
@@ -73,6 +91,22 @@ struct AudioInputResult {
   std::string performanceMode;
   std::string inputPreset;
   std::string timestampSource;
+  // Input hardware/safety/stream delay and separate negotiated I/O buffer,
+  // both in capture-rate frames. Delay assumes a FIRST-SAMPLE timestamp (HAL
+  // mHostTime or the already buffer-adjusted CallbackEstimate). Never subtract
+  // the buffer again from those timestamps. A raw callback-entry timestamp
+  // needs its buffer duration removed first, before applying this delay.
+  // Unknown means at least one required property was unavailable; zero alone
+  // does not indicate whether the driver reported a delay. BoxInputCapture /
+  // box_routing_owner and non-macOS backends leave these fields unknown/zero.
+  uint32_t inputLatencyFrames = 0;
+  // Negotiated I/O size, in capture-rate frames, independently available even
+  // when optional hardware latency properties leave inputLatencySource unknown.
+  uint32_t inputBufferFrames = 0;
+  std::string inputLatencySource = "unknown";
+  // Optional live validity of the opening snapshot. Property notifications
+  // invalidate it without stopping capture; null leaves source authoritative.
+  std::shared_ptr<const std::atomic<bool>> inputLatencyStable;
 };
 
 struct AudioInputStats {
@@ -80,6 +114,11 @@ struct AudioInputStats {
   uint64_t deliveredFrames = 0;
   uint64_t overruns = 0;
   uint64_t deliveryWakeups = 0;
+  uint32_t bufferWarnings = AudioBufferWarningNone;
+  // macOS AUHAL slice-race blocks replaced by equal-length silence at their
+  // own timestamps; per take, retained after stop. Separate from ring overruns
+  // and consumer event/window drops; these blocks still advance deliveredFrames.
+  uint64_t renderSliceDrops = 0;
 };
 
 using AudioInputSink = std::function<void(const AudioInputBlockView&)>;
@@ -112,6 +151,8 @@ class AudioInput {
                         const std::vector<AudioInputDevice>* inventory = nullptr);
   // Retention is opt-in and never leaves hardware capture running. Reuse is
   // permitted only for an unchanged device/channel/configuration.
+  // macOS prepared retention also retains the device-buffer lease. A real
+  // stop(false) or destruction releases it; hardware capture is always stopped.
   void stop(bool retainPrepared = false);
   AudioInputState state() const;
   AudioInputStats stats() const;

@@ -133,6 +133,9 @@ class OboeInputBackend final : public AudioInputBackend {
   AudioInputResult open(const AudioInputConfig& config, AudioInputPush push,
                         void* context) override {
     stop();
+    if (config.requestedBufferFrames != 0 || config.maximumAcceptableBufferFrames != 0)
+      return AudioInputResult::failure(AudioInputState::Unsupported,
+          "Input buffer-size requests are unsupported on this platform", config.channel);
     int32_t requestedDevice = 0;
     if (!deviceIdFromUid(config.deviceUid, requestedDevice))
       return failure("Android audio input UID is invalid", config.channel);

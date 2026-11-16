@@ -25,45 +25,32 @@
 #include <vector>
 
 #include <zcore/audio/audio_input_timestamp.h>
+#include "audio_input_macos_latency.h"
+#include "audio_input_macos_render.h"
+#include "audio_device_macos_buffer.h"
+#include "audio_device_macos_buffer_properties.h"
 
 namespace singz {
 namespace {
 
-constexpr uint32_t kMaximumFrames = 16384;
-constexpr uint32_t kDeviceAliveChanged = 1u << 0;
-constexpr uint32_t kSampleRateChanged = 1u << 1;
-constexpr uint32_t kStreamConfigurationChanged = 1u << 2;
+static_assert(kAudioUnitErr_TooManyFramesToProcess == detail::kMacInputTooManyFrames);
+
+static_assert(kAudioDevicePropertyDeviceIsAlive == detail::audioHostFourCc('l', 'i', 'v', 'n'));
+static_assert(kAudioDevicePropertyNominalSampleRate == detail::audioHostFourCc('n', 's', 'r', 't'));
+static_assert(kAudioDevicePropertyStreamConfiguration == detail::audioHostFourCc('s', 'l', 'a', 'y'));
+static_assert(kAudioDevicePropertyStreams == detail::audioHostFourCc('s', 't', 'm', '#'));
+static_assert(kAudioDevicePropertyBufferFrameSize == detail::audioHostFourCc('f', 's', 'i', 'z'));
+static_assert(kAudioStreamPropertyPhysicalFormat == detail::audioHostFourCc('p', 'f', 't', ' '));
+static_assert(kAudioStreamPropertyVirtualFormat == detail::audioHostFourCc('s', 'f', 'm', 't'));
 
 struct DeviceListenerContext {
   std::atomic<uint32_t> pendingChanges{0};
+  std::atomic<bool> latencyStable{true};
+  std::atomic<uint64_t> latencyRevision{0};
 };
 
-struct RetiredDeviceListener {
-  std::shared_ptr<DeviceListenerContext> context;
-  dispatch_queue_t queue = nullptr;
-  AudioObjectPropertyListenerBlock block = nullptr;
-};
-
-// Listener removal failure is exceptional (normally only a broken/disappeared
-// AudioObject). Quarantine just those callbacks; every successful capture is
-// reclaimed after a dispatch-queue execution barrier.
-std::mutex& quarantinedListenerMutex() {
-  // Deliberately process-lifetime: if CoreAudio refuses listener removal, a
-  // registered block may remain callable until process exit. A normal static
-  // destructor would release its raw-captured context during library teardown
-  // while CoreAudio threads can still run.
-  static std::mutex* mutex = new std::mutex();
-  return *mutex;
-}
-
-std::vector<RetiredDeviceListener>& quarantinedListeners() {
-  // Exceptional removal failures leak one tiny queue/block/context by design.
-  // Successful captures take the dispatch barrier path and never enter here.
-  static std::vector<RetiredDeviceListener>* listeners =
-      new std::vector<RetiredDeviceListener>();
-  return *listeners;
-}
-
+// The copied listener block owns its shared context. Failed removal retains
+// the already-allocated block/queue until process exit, without allocating on stop.
 AudioObjectPropertyAddress address(AudioObjectPropertySelector selector,
                                    AudioObjectPropertyScope scope,
                                    AudioObjectPropertyElement element = kAudioObjectPropertyElementMain) {
@@ -75,6 +62,40 @@ bool getProperty(AudioObjectID object, AudioObjectPropertyAddress property, T& v
   UInt32 size = sizeof(value);
   return AudioObjectGetPropertyData(object, &property, 0, nullptr, &size, &value) == noErr &&
          size == sizeof(value);
+}
+
+std::optional<uint32_t> frameProperty(AudioObjectID object,
+                                     AudioObjectPropertySelector selector,
+                                     AudioObjectPropertyScope scope) {
+  UInt32 value = 0;
+  if (!getProperty(object, address(selector, scope), value)) return std::nullopt;
+  return value;
+}
+
+// Select the stream containing the physical input channel, rather than using
+// the first stream (multi-stream interfaces can have different latencies).
+AudioStreamID inputStream(AudioDeviceID device, uint32_t channel) {
+  const auto property = address(kAudioDevicePropertyStreams, kAudioDevicePropertyScopeInput);
+  UInt32 size = 0;
+  if (AudioObjectGetPropertyDataSize(device, &property, 0, nullptr, &size) != noErr ||
+      !size || size % sizeof(AudioStreamID) || size > 4096 * sizeof(AudioStreamID))
+    return kAudioObjectUnknown;
+  std::vector<AudioStreamID> streams(size / sizeof(AudioStreamID));
+  const UInt32 capacity = size;
+  if (AudioObjectGetPropertyData(device, &property, 0, nullptr, &size, streams.data()) != noErr ||
+      size > capacity || size % sizeof(AudioStreamID)) return kAudioObjectUnknown;
+  streams.resize(size / sizeof(AudioStreamID));
+  for (const auto stream : streams) {
+    UInt32 first = 0;
+    AudioStreamBasicDescription format{};
+    if (!getProperty(stream, address(kAudioStreamPropertyStartingChannel,
+                                     kAudioObjectPropertyScopeGlobal), first) || !first ||
+        !getProperty(stream, address(kAudioStreamPropertyVirtualFormat,
+                                     kAudioObjectPropertyScopeGlobal), format)) continue;
+    if (channel >= first - 1 && uint64_t{channel} < uint64_t{first - 1} + format.mChannelsPerFrame)
+      return stream;
+  }
+  return kAudioObjectUnknown;
 }
 
 std::string cfString(CFStringRef value) {
@@ -97,23 +118,73 @@ std::string stringProperty(AudioObjectID object, AudioObjectPropertyAddress prop
   return result;
 }
 
-uint32_t inputChannelCount(AudioDeviceID device) {
+bool inputChannelConfiguration(AudioDeviceID device, std::vector<uint32_t>& channels) {
   AudioObjectPropertyAddress property = address(kAudioDevicePropertyStreamConfiguration,
                                                 kAudioDevicePropertyScopeInput);
   UInt32 size = 0;
   if (AudioObjectGetPropertyDataSize(device, &property, 0, nullptr, &size) != noErr ||
-      size < offsetof(AudioBufferList, mBuffers) + sizeof(AudioBuffer)) {
-    return 0;
+      size < offsetof(AudioBufferList, mBuffers) + sizeof(AudioBuffer) ||
+      size > offsetof(AudioBufferList, mBuffers) + 4096 * sizeof(AudioBuffer)) {
+    return false;
   }
   std::vector<uint8_t> storage(size);
   AudioBufferList* list = reinterpret_cast<AudioBufferList*>(storage.data());
-  if (AudioObjectGetPropertyData(device, &property, 0, nullptr, &size, list) != noErr) return 0;
+  const UInt32 capacity = size;
+  if (AudioObjectGetPropertyData(device, &property, 0, nullptr, &size, list) != noErr ||
+      size > capacity || size < offsetof(AudioBufferList, mBuffers) ||
+      list->mNumberBuffers > (size - offsetof(AudioBufferList, mBuffers)) / sizeof(AudioBuffer))
+    return false;
   uint64_t total = 0;
-  for (UInt32 i = 0; i < list->mNumberBuffers; ++i) total += list->mBuffers[i].mNumberChannels;
+  std::vector<uint32_t> observed;
+  for (UInt32 i = 0; i < list->mNumberBuffers; ++i) {
+    total += list->mBuffers[i].mNumberChannels;
+    observed.push_back(list->mBuffers[i].mNumberChannels);
+  }
   // A bounded public/device protocol and a bounded channel-label loop. No
   // real interface approaches this; reject corrupt driver metadata instead
   // of allocating from it.
-  return total <= 4096 ? static_cast<uint32_t>(total) : 0;
+  if (total > 4096) return false;
+  channels = std::move(observed);
+  return true;
+}
+
+uint32_t inputChannelCount(AudioDeviceID device) {
+  std::vector<uint32_t> channels;
+  if (!inputChannelConfiguration(device, channels)) return 0;
+  uint32_t total = 0;
+  for (const auto count : channels) total += count;
+  return total;
+}
+
+bool inputStreamConfiguration(AudioDeviceID device,
+                              detail::MacAudioInputStreamConfiguration& facts) {
+  facts = {};
+  facts.identity = device;
+  if (!getProperty(device, address(kAudioDevicePropertyNominalSampleRate,
+                                   kAudioObjectPropertyScopeGlobal), facts.rate) ||
+      !std::isfinite(facts.rate) || facts.rate <= 0 ||
+      !inputChannelConfiguration(device, facts.inputChannels)) return false;
+  auto property = address(kAudioDevicePropertyStreams, kAudioDevicePropertyScopeInput);
+  UInt32 size = 0;
+  if (AudioObjectGetPropertyDataSize(device, &property, 0, nullptr, &size) != noErr ||
+      !size || size % sizeof(AudioStreamID) || size > 4096 * sizeof(AudioStreamID)) return false;
+  std::vector<AudioStreamID> streams(size / sizeof(AudioStreamID));
+  const UInt32 capacity = size;
+  if (AudioObjectGetPropertyData(device, &property, 0, nullptr, &size, streams.data()) != noErr ||
+      size != capacity) return false;
+  const auto formatFacts = [](const AudioStreamBasicDescription& f) {
+    return detail::MacAudioHostStreamFormat{f.mSampleRate, f.mFormatID, f.mFormatFlags,
+        f.mBytesPerPacket, f.mFramesPerPacket, f.mBytesPerFrame, f.mChannelsPerFrame, f.mBitsPerChannel};
+  };
+  for (const auto stream : streams) {
+    AudioStreamBasicDescription physical{}, virtualFormat{};
+    if (!getProperty(stream, address(kAudioStreamPropertyPhysicalFormat,
+                                      kAudioObjectPropertyScopeGlobal), physical) ||
+        !getProperty(stream, address(kAudioStreamPropertyVirtualFormat,
+                                      kAudioObjectPropertyScopeGlobal), virtualFormat)) return false;
+    facts.inputStreams.push_back({stream, formatFacts(physical), formatFacts(virtualFormat)});
+  }
+  return true;
 }
 
 std::vector<AudioDeviceID> allDeviceIds(std::string* error) {
@@ -151,9 +222,16 @@ class MacAudioInputBackend final : public AudioInputBackend {
  public:
   ~MacAudioInputBackend() override { stop(); }
 
+  void setPositionPush(AudioInputPositionPush push) override { positionPush_ = push; }
+
   AudioInputResult open(const AudioInputConfig& config, AudioInputPush push,
                         void* context) override {
     stop();
+    if (config.requestedBufferFrames != 0 && !config.allowSharedDeviceBufferChange)
+      return AudioInputResult::failure(AudioInputState::Unsupported,
+          "Shared CoreAudio input buffer changes require allowSharedDeviceBufferChange",
+          config.channel);
+    bufferWarnings_ = AudioBufferWarningNone;
     push_ = push;
     context_ = context;
 
@@ -173,7 +251,12 @@ class MacAudioInputBackend final : public AudioInputBackend {
           AudioInputState::Error,
           "audio input device disappeared",
           config.channel);
-    const uint32_t channels = inputChannelCount(selected);
+    std::vector<uint32_t> channelLayout;
+    if (!inputChannelConfiguration(selected, channelLayout))
+      return AudioInputResult::failure(
+          AudioInputState::Error, "audio input stream configuration is unavailable", config.channel);
+    uint32_t channels = 0;
+    for (const auto count : channelLayout) channels += count;
     if (config.channel >= channels)
       return AudioInputResult::failure(
           AudioInputState::Error, "audio input channel disappeared", config.channel);
@@ -185,6 +268,7 @@ class MacAudioInputBackend final : public AudioInputBackend {
       return AudioInputResult::failure(
           AudioInputState::Error, "audio input device is not alive", config.channel);
     selectedDevice_ = selected;
+    selectedDeviceUid_ = config.deviceUid;
     channel_ = config.channel;
 
     Float64 nominalRate = 0;
@@ -219,6 +303,7 @@ class MacAudioInputBackend final : public AudioInputBackend {
                                   kAudioUnitScope_Global, 0, &selected, sizeof(selected));
     if (status != noErr) return fail("select AUHAL device", status, config.channel);
 
+
     AudioStreamBasicDescription format{};
     format.mSampleRate = nominalRate;
     format.mFormatID = kAudioFormatLinearPCM;
@@ -246,9 +331,36 @@ class MacAudioInputBackend final : public AudioInputBackend {
     UInt32 propertySize = sizeof(maxFrames);
     status = AudioUnitGetProperty(unit_, kAudioUnitProperty_MaximumFramesPerSlice,
                                   kAudioUnitScope_Global, 0, &maxFrames, &propertySize);
-    if (status != noErr || maxFrames == 0) maxFrames = 4096;
-    if (maxFrames > kMaximumFrames)
+    const auto initialSlice = status == noErr && propertySize == sizeof(maxFrames) && maxFrames != 0
+        ? std::optional<uint32_t>{maxFrames} : std::nullopt;
+    const auto preparation = detail::macAudioInputPreparation(
+        initialSlice);
+    bufferWarnings_ |= preparation.warnings;
+    maxFrames = preparation.frames;
+    if (maxFrames == 0)
       return failMessage("audio device callback is larger than the core limit", config.channel);
+    {
+      detail::MacAudioBufferProperties properties{selectedDevice_, selectedDeviceUid_};
+      // Ordinary capture may hold a capacity-only lease when optional buffer
+      // metadata is missing. Retention keeps that reservation until real close.
+      const auto buffer = detail::requestMacAudioBuffer(
+          properties, config.requestedBufferFrames, maxFrames, bufferOwnership_,
+          config.maximumAcceptableBufferFrames, detail::macAudioBufferLedger(), false,
+          detail::MacAudioInputBufferCapacity{maxFrames, [&](uint32_t storage) {
+            const auto capacity = detail::prepareMacAudioInputUnitSlice(storage, initialSlice,
+                bufferWarnings_, [&](uint32_t frames) {
+                  return AudioUnitSetProperty(unit_, kAudioUnitProperty_MaximumFramesPerSlice,
+                      kAudioUnitScope_Global, 0, &frames, sizeof(frames)) == noErr;
+                }, [&] { return unitSlice(); });
+            // Ordinary capture reserves the old limit until post-init readback;
+            // another owner cannot restore into an initialize-time limit change.
+            return config.requestedBufferFrames == 0
+                ? std::min(capacity, initialSlice.value_or(0)) : capacity;
+          }});
+      bufferWarnings_ |= buffer.warnings;
+      if (!buffer.ok()) return failMessage(buffer.message, config.channel);
+      if (buffer.frames == 0) bufferWarnings_ |= AudioBufferWarningReadFailed;
+    }
     renderBuffer_.resize(maxFrames);
     mach_timebase_info_data_t timebase{};
     if (mach_timebase_info(&timebase) != KERN_SUCCESS || !timebase.denom)
@@ -262,61 +374,116 @@ class MacAudioInputBackend final : public AudioInputBackend {
     status = AudioUnitInitialize(unit_);
     if (status != noErr) return fail("initialize AUHAL", status, config.channel);
     initialized_ = true;
+    const auto confirmedSlice = unitSlice();
+    if (!confirmedSlice || *confirmedSlice < maxFrames) bufferWarnings_ |= AudioBufferWarningReadFailed;
+    const auto confirmedCapacity = detail::macAudioInputConfirmedCapacity(maxFrames, confirmedSlice);
+    if (!detail::updateMacAudioBufferCapacity(bufferOwnership_, confirmedCapacity))
+      return failMessage("audio input buffer lease disappeared", config.channel);
+    renderMaximumFrames_ = confirmedSlice ? confirmedCapacity : maxFrames;
+    propertySize = sizeof(format);
+    status = AudioUnitGetProperty(unit_, kAudioUnitProperty_StreamFormat,
+                                  kAudioUnitScope_Output, 1, &format, &propertySize);
+    if (status != noErr || propertySize != sizeof(format) ||
+        !std::isfinite(format.mSampleRate) || format.mSampleRate <= 0)
+      return failMessage("AUHAL negotiated sample rate is unavailable", config.channel);
+    deviceSampleRate_ = nominalRate;
+    sampleRate_ = format.mSampleRate;
+    // Snapshot the configured/initialized unit's device facts, not the earlier
+    // metadata used while choosing its channel map.
+    if (!detail::readMacAudioInputConfiguration(openedConfiguration_, [&](auto& facts) {
+          return inputStreamConfiguration(selectedDevice_, facts);
+        }) || openedConfiguration_.inputChannels != channelLayout ||
+        openedConfiguration_.rate != nominalRate)
+      return failMessage("audio input stream configuration changed while opening", config.channel);
     listenerContext_ = std::make_shared<DeviceListenerContext>();
     listenerQueue_ = dispatch_queue_create("com.lexasoft.singz.audio-input-device", nullptr);
     if (!listenerQueue_)
       return failMessage("could not create audio device listener queue", config.channel);
-    DeviceListenerContext* listener = listenerContext_.get();
+    const auto listener = listenerContext_;
     listenerBlock_ = Block_copy(^(UInt32 count,
                                   const AudioObjectPropertyAddress properties[]) {
       uint32_t changes = 0;
       for (UInt32 i = 0; i < count; ++i) {
-        if (properties[i].mSelector == kAudioDevicePropertyDeviceIsAlive)
-          changes |= kDeviceAliveChanged;
-        else if (properties[i].mSelector == kAudioDevicePropertyNominalSampleRate)
-          changes |= kSampleRateChanged;
-        else if (properties[i].mSelector == kAudioDevicePropertyStreamConfiguration)
-          changes |= kStreamConfigurationChanged;
+        changes |= detail::macInputNotificationChanges(properties[i].mSelector);
       }
+      if (changes & detail::kMacInputLatencyChanged)
+        listener->latencyRevision.fetch_add(1, std::memory_order_seq_cst);
+      (void)detail::macInputControlChanges(changes, listener->latencyStable);
       if (changes) listener->pendingChanges.fetch_or(changes, std::memory_order_release);
     });
     const AudioObjectPropertyAddress watched[] = {
         address(kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal),
         address(kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal),
+        address(kAudioDevicePropertyStreams, kAudioDevicePropertyScopeInput),
         address(kAudioDevicePropertyStreamConfiguration, kAudioDevicePropertyScopeInput)};
     for (const AudioObjectPropertyAddress& property : watched) {
       status = AudioObjectAddPropertyListenerBlock(selectedDevice_, &property,
                                                    listenerQueue_, listenerBlock_);
       if (status != noErr) return fail("watch AUHAL device", status, config.channel);
-      watchedProperties_.push_back(property);
+      watchedProperties_.push_back({selectedDevice_, property});
     }
-    sampleRate_ = nominalRate;
+    selectedStream_ = inputStream(selectedDevice_, channel_);
+    // These are optional driver properties. Missing queries/listeners disable
+    // reported compensation, but must not make an otherwise usable mic fail.
+    const AudioObjectPropertyAddress latencyProperties[] = {
+        address(kAudioDevicePropertyLatency, kAudioDevicePropertyScopeInput),
+        address(kAudioDevicePropertySafetyOffset, kAudioDevicePropertyScopeInput),
+        address(kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal)};
+    latencyWatchable_ = true;
+    for (const auto& property : latencyProperties) {
+      if (AudioObjectAddPropertyListenerBlock(selectedDevice_, &property,
+                                               listenerQueue_, listenerBlock_) == noErr)
+        watchedProperties_.push_back({selectedDevice_, property});
+      else latencyWatchable_ = false;
+    }
+    for (const auto& stream : openedConfiguration_.inputStreams) {
+      for (const auto selector : {kAudioStreamPropertyVirtualFormat, kAudioStreamPropertyPhysicalFormat}) {
+        const auto property = address(selector, kAudioObjectPropertyScopeGlobal);
+        status = AudioObjectAddPropertyListenerBlock(stream.identity, &property, listenerQueue_, listenerBlock_);
+        if (status != noErr) return fail("watch AUHAL input stream format", status, config.channel);
+        watchedProperties_.push_back({stream.identity, property});
+      }
+    }
+    const auto streamLatency = address(kAudioStreamPropertyLatency, kAudioObjectPropertyScopeGlobal);
+    if (selectedStream_ != kAudioObjectUnknown && AudioObjectAddPropertyListenerBlock(
+        selectedStream_, &streamLatency, listenerQueue_, listenerBlock_) == noErr)
+      watchedProperties_.push_back({selectedStream_, streamLatency});
+    else latencyWatchable_ = false;
+    // Fence configuration changes between channel-map selection and listener
+    // installation; redundant buffer-driven notifications remain harmless.
+    if (streamConfigurationChanged())
+      return failMessage("audio input stream configuration changed while opening", config.channel);
     callbackFailure_.store(0, std::memory_order_relaxed);
-    return AudioInputResult::success(AudioInputState::Starting, sampleRate_, channel_);
+    return resultWithLatency(AudioInputState::Starting);
   }
 
   AudioInputResult start() override {
     if (!unit_ || !initialized_)
       return AudioInputResult::failure(
           AudioInputState::Error, "AUHAL is not prepared", channel_);
+    // Also fences retained-prepared suspension, even when no listener bit was
+    // delivered. A new map/format requires reopening rather than rebasing it.
+    if (streamConfigurationChanged())
+      return failMessage("audio input stream configuration changed; restart capture", channel_);
+    renderRecovery_ = {};
+    renderSliceDrops_.store(0, std::memory_order_relaxed);
     const OSStatus status = AudioOutputUnitStart(unit_);
     if (status != noErr) return fail("start AUHAL", status, channel_);
     started_ = true;
-    return AudioInputResult::success(AudioInputState::Running, sampleRate_, channel_);
+    return resultWithLatency(AudioInputState::Running);
   }
 
   bool suspendPrepared() override {
-    if (!unit_ || !initialized_) return false;
-    if (started_ && AudioOutputUnitStop(unit_) != noErr) return false;
-    started_ = false;
-    return true;
+    return detail::suspendMacAudioInputPrepared(unit_ && initialized_, started_, [this] {
+      return AudioOutputUnitStop(unit_) == noErr;
+    });
   }
 
-  void stop() override {
+  void stop() noexcept override {
     bool removedAll = true;
     if (selectedDevice_ != kAudioObjectUnknown && listenerContext_) {
-      for (const AudioObjectPropertyAddress& property : watchedProperties_) {
-        if (AudioObjectRemovePropertyListenerBlock(selectedDevice_, &property,
+      for (const auto& [object, property] : watchedProperties_) {
+        if (AudioObjectRemovePropertyListenerBlock(object, &property,
                                                    listenerQueue_, listenerBlock_) != noErr)
           removedAll = false;
       }
@@ -327,11 +494,10 @@ class MacAudioInputBackend final : public AudioInputBackend {
         dispatch_sync_f(listenerQueue_, nullptr, [](void*) {});
         Block_release(listenerBlock_);
         dispatch_release(listenerQueue_);
-      } else {
-        std::lock_guard<std::mutex> lock(quarantinedListenerMutex());
-        quarantinedListeners().push_back(
-            {listenerContext_, listenerQueue_, listenerBlock_});
       }
+      // On failed removal the retained block pins its captured shared context;
+      // deliberately retain our block/queue references, without a heap push.
+
     }
     watchedProperties_.clear();
     listenerContext_.reset();
@@ -342,48 +508,67 @@ class MacAudioInputBackend final : public AudioInputBackend {
       if (initialized_) AudioUnitUninitialize(unit_);
       AudioComponentInstanceDispose(unit_);
     }
+    detail::MacAudioBufferProperties properties{selectedDevice_, selectedDeviceUid_};
+    if (bufferOwnership_.token != 0) {
+      try {
+        bufferWarnings_ |= detail::restoreMacAudioBuffer(properties, bufferOwnership_);
+      } catch (...) {
+        bufferWarnings_ |= AudioBufferWarningRestoreFailed;
+      }
+    }
     unit_ = nullptr;
     started_ = false;
     initialized_ = false;
     renderBuffer_.clear();
     push_ = nullptr;
+    positionPush_ = nullptr;
     context_ = nullptr;
-    selectedDevice_ = kAudioObjectUnknown;
+    if (bufferOwnership_.token == 0) selectedDevice_ = kAudioObjectUnknown;
+    selectedStream_ = kAudioObjectUnknown;
+    latencyWatchable_ = false;
+  }
+
+  uint32_t bufferWarnings() const noexcept override { return bufferWarnings_; }
+  uint64_t renderSliceDrops() const noexcept override {
+    return renderSliceDrops_.load(std::memory_order_relaxed);
   }
 
   bool takeFailure(std::string& error) override {
     const uint32_t changes = listenerContext_
-                                 ? listenerContext_->pendingChanges.exchange(
-                                       0, std::memory_order_acq_rel)
-                                 : 0;
-    if (changes & kDeviceAliveChanged) {
+        ? listenerContext_->pendingChanges.exchange(0, std::memory_order_acq_rel)
+        : 0;
+    const auto failure = listenerContext_ ? detail::macInputTakeControlFailure(
+        changes, listenerContext_->latencyStable, [&] {
       UInt32 alive = 0;
-      if (!getProperty(selectedDevice_,
+      return getProperty(selectedDevice_,
                        address(kAudioDevicePropertyDeviceIsAlive,
                                kAudioObjectPropertyScopeGlobal),
-                       alive) || !alive) {
-        error = "audio input device disconnected";
-        return true;
-      }
-    }
-    if (changes & kSampleRateChanged) {
+                       alive) && alive != 0;
+    }, [&] {
       Float64 nominalRate = 0;
-      if (!getProperty(selectedDevice_,
+      return getProperty(selectedDevice_,
                        address(kAudioDevicePropertyNominalSampleRate,
                                kAudioObjectPropertyScopeGlobal),
-                       nominalRate) || !std::isfinite(nominalRate) || nominalRate <= 0 ||
-          nominalRate != sampleRate_) {
+                       nominalRate) && std::isfinite(nominalRate) && nominalRate > 0 &&
+          nominalRate == deviceSampleRate_;
+    }, [&] { return !streamConfigurationChanged(); }) : detail::MacInputControlFailure::None;
+    switch (failure) {
+      case detail::MacInputControlFailure::DeviceLost:
+        error = "audio input device disconnected";
+        return true;
+      case detail::MacInputControlFailure::RateChanged:
         error = "audio input sample rate changed; restart capture";
         return true;
-      }
+      case detail::MacInputControlFailure::ConfigurationChanged:
+        error = "audio input stream configuration changed; restart capture";
+        return true;
+      case detail::MacInputControlFailure::None: break;
     }
-    if (changes & kStreamConfigurationChanged) {
-      const uint32_t channels = inputChannelCount(selectedDevice_);
-      error = channel_ >= channels
-                  ? "audio input channel disappeared"
-                  : "audio input stream configuration changed; restart capture";
-      return true;
-    }
+    if (latencyBasis_.reported && listenerContext_ && (changes & detail::kMacInputLatencyChanged))
+      detail::refreshMacInputLatency(latencyBasis_, listenerContext_->latencyStable,
+          listenerContext_->latencyRevision, [&] { return readLatency(); });
+    // Buffer/latency notifications are advisory; stream selectors inspect
+    // facts and only a real difference (or persistent unreadability) fails.
     const int32_t status = callbackFailure_.exchange(0, std::memory_order_acq_rel);
     if (!status) return false;
     error = status == kCallbackTooLarge
@@ -393,6 +578,55 @@ class MacAudioInputBackend final : public AudioInputBackend {
   }
 
  private:
+  std::optional<uint32_t> unitSlice() const {
+    UInt32 frames = 0, size = sizeof(frames);
+    if (AudioUnitGetProperty(unit_, kAudioUnitProperty_MaximumFramesPerSlice,
+        kAudioUnitScope_Global, 0, &frames, &size) != noErr || size != sizeof(frames) || !frames)
+      return std::nullopt;
+    return frames;
+  }
+
+  bool streamConfigurationChanged() {
+    return !detail::refreshMacAudioInputConfiguration(openedConfiguration_, [&](auto& facts) {
+      return inputStreamConfiguration(selectedDevice_, facts);
+    });
+  }
+
+  detail::MacInputLatency readLatency() const {
+    Float64 deviceRate = 0;
+    AudioStreamBasicDescription physicalFormat{};
+    if (!latencyWatchable_ ||
+        !getProperty(selectedDevice_, address(kAudioDevicePropertyNominalSampleRate,
+                                               kAudioObjectPropertyScopeGlobal), deviceRate) ||
+        !getProperty(selectedStream_, address(kAudioStreamPropertyPhysicalFormat,
+                                               kAudioObjectPropertyScopeGlobal), physicalFormat))
+      return {};
+    return detail::macInputLatency(
+        frameProperty(selectedDevice_, kAudioDevicePropertyLatency, kAudioDevicePropertyScopeInput),
+        frameProperty(selectedDevice_, kAudioDevicePropertySafetyOffset, kAudioDevicePropertyScopeInput),
+        frameProperty(selectedStream_, kAudioStreamPropertyLatency, kAudioObjectPropertyScopeGlobal),
+        frameProperty(selectedDevice_, kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal),
+        deviceRate, sampleRate_, physicalFormat.mSampleRate);
+  }
+
+  AudioInputResult resultWithLatency(AudioInputState state) {
+    auto result = AudioInputResult::success(state, sampleRate_, channel_);
+    const auto buffer = frameProperty(selectedDevice_, kAudioDevicePropertyBufferFrameSize,
+                                      kAudioObjectPropertyScopeGlobal);
+    // Buffer negotiation is useful even when optional latency properties or
+    // their listeners are unavailable. Preserve capture-rate frame units.
+    result.inputBufferFrames = detail::macInputLatency(
+        0, 0, 0, buffer, deviceSampleRate_, sampleRate_, deviceSampleRate_).bufferFrames;
+    result.inputLatencyStable = std::shared_ptr<const std::atomic<bool>>(
+        listenerContext_, &listenerContext_->latencyStable);
+    const auto latency = readLatency();
+    latencyBasis_ = latency;
+    result.inputLatencyFrames = latency.frames;
+    if (latency.reported) result.inputBufferFrames = latency.bufferFrames;
+    result.inputLatencySource = latency.reported ? "reported" : "unknown";
+    return result;
+  }
+
   static constexpr int32_t kCallbackTooLarge = std::numeric_limits<int32_t>::min();
 
   static OSStatus renderCallback(void* context, AudioUnitRenderActionFlags* flags,
@@ -402,7 +636,7 @@ class MacAudioInputBackend final : public AudioInputBackend {
     MacAudioInputBackend* self = static_cast<MacAudioInputBackend*>(context);
     if (!self || !self->unit_ || !self->push_ || frames == 0)
       return noErr;
-    if (frames > self->renderBuffer_.size()) {
+    if (detail::macAudioInputCallbackTooLarge(frames, self->renderMaximumFrames_)) {
       self->callbackFailure_.store(kCallbackTooLarge, std::memory_order_release);
       return noErr;
     }
@@ -412,15 +646,22 @@ class MacAudioInputBackend final : public AudioInputBackend {
     list.mBuffers[0].mDataByteSize = frames * sizeof(float);
     list.mBuffers[0].mData = self->renderBuffer_.data();
     const OSStatus status = AudioUnitRender(self->unit_, flags, timestamp, 1, frames, &list);
-    if (status != noErr) {
-      // Some drivers stop invoking the callback after the first render error,
-      // so waiting for repeated failures can lose the only notification.
-      self->callbackFailure_.store(static_cast<int32_t>(status), std::memory_order_release);
-      return status;
-    }
     const uint64_t callbackNs = static_cast<uint64_t>(
         static_cast<long double>(callbackTicks) *
         static_cast<long double>(self->nsPerHostTick_));
+    const auto disposition = detail::observeMacInputRender(
+        status, callbackNs, self->renderRecovery_, self->renderSliceDrops_);
+    if (disposition == detail::MacInputRenderDisposition::Fatal) {
+      // Other errors still fail immediately; persistent slice errors use the
+      // identical status publication/return path after the bounded grace.
+      self->callbackFailure_.store(static_cast<int32_t>(status), std::memory_order_release);
+      return status;
+    }
+    // Discard failed signal, not elapsed time: substitute bounded silence and
+    // use this callback's normal timestamps/push so take alignment survives.
+    // No unit property query/set or lifecycle repair is allowed here.
+    if (!detail::prepareMacInputRenderBlock(disposition, self->renderBuffer_.data(), frames))
+      return noErr;
     const bool hardwareValid =
         timestamp && (timestamp->mFlags & kAudioTimeStampHostTimeValid) &&
         timestamp->mHostTime != 0;
@@ -430,11 +671,22 @@ class MacAudioInputBackend final : public AudioInputBackend {
         : 0;
     const AudioInputTimestampProjection projected = resolveAudioInputTimestamp(
         hardwareValid, hardwareNs, callbackNs, frames, self->sampleRate_);
-    self->push_(self->context_, self->renderBuffer_.data(), frames,
-                projected.sampleHostTimeNs, callbackNs,
-                projected.usedHardwareAnchor
-                    ? AudioInputTimestampQuality::Hardware
-                    : AudioInputTimestampQuality::CallbackEstimate);
+    if (self->positionPush_) {
+      self->positionPush_(self->context_, self->renderBuffer_.data(), frames,
+                          projected.sampleHostTimeNs, callbackNs,
+                          projected.usedHardwareAnchor
+                              ? AudioInputTimestampQuality::Hardware
+                              : AudioInputTimestampQuality::CallbackEstimate,
+                          resolveAudioInputSourcePosition(
+                              timestamp && (timestamp->mFlags & kAudioTimeStampSampleTimeValid),
+                              timestamp ? timestamp->mSampleTime : 0));
+    } else {
+      self->push_(self->context_, self->renderBuffer_.data(), frames,
+                  projected.sampleHostTimeNs, callbackNs,
+                  projected.usedHardwareAnchor
+                      ? AudioInputTimestampQuality::Hardware
+                      : AudioInputTimestampQuality::CallbackEstimate);
+    }
     return noErr;
   }
 
@@ -451,17 +703,29 @@ class MacAudioInputBackend final : public AudioInputBackend {
   bool initialized_ = false;
   bool started_ = false;
   AudioDeviceID selectedDevice_ = kAudioObjectUnknown;
+  AudioStreamID selectedStream_ = kAudioObjectUnknown;
+  bool latencyWatchable_ = false;
+  detail::MacInputLatency latencyBasis_;
+  detail::MacAudioBufferOwnership bufferOwnership_;
+  uint32_t bufferWarnings_ = AudioBufferWarningNone;
+  std::string selectedDeviceUid_;
   double sampleRate_ = 0;
+  double deviceSampleRate_ = 0;
   uint32_t channel_ = 0;
+  detail::MacAudioInputStreamConfiguration openedConfiguration_;
   double nsPerHostTick_ = 0;
   std::vector<float> renderBuffer_;
+  uint32_t renderMaximumFrames_ = 0;
   AudioInputPush push_ = nullptr;
+  AudioInputPositionPush positionPush_ = nullptr;
   void* context_ = nullptr;
   std::atomic<int32_t> callbackFailure_{0};
+  detail::MacInputRenderRecovery renderRecovery_;
+  std::atomic<uint64_t> renderSliceDrops_{0};
   std::shared_ptr<DeviceListenerContext> listenerContext_;
   dispatch_queue_t listenerQueue_ = nullptr;
   AudioObjectPropertyListenerBlock listenerBlock_ = nullptr;
-  std::vector<AudioObjectPropertyAddress> watchedProperties_;
+  std::vector<std::pair<AudioObjectID, AudioObjectPropertyAddress>> watchedProperties_;
 };
 
 }  // namespace

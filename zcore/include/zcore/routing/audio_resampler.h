@@ -65,8 +65,9 @@ struct ResamplePosition {
     // Nominal formats are 8–192 kHz. Either clock estimate may differ from
     // those endpoint limits by at most 0.5% to account for physical drift.
     double sourceRate, outputRate;
-    // Only a bounded, sample-counter-verified closed timestamp interval may
-    // use a locally corrected slope. Endpoint/output rate limits do not change.
+    // Only a bounded closed timestamp interval approved by the sample clock
+    // (counter verification or phase tolerance) may use a corrected slope.
+    // Endpoint/output rate limits do not change.
     bool localClockCorrection{false};
     // Optional fixed source format for minimum-phase filter shape. Sample
     // positions still follow sourceRate; the linear-phase reader ignores it.

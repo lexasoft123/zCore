@@ -30,10 +30,19 @@ bool AudioInputCallbackEndpoint::push(
     void* context, const float* mono, uint32_t frames,
     uint64_t sampleHostTimeNs, uint64_t callbackHostTimeNs,
     AudioInputTimestampQuality timestampQuality) noexcept {
+  return pushWithPosition(context, mono, frames, sampleHostTimeNs,
+                          callbackHostTimeNs, timestampQuality, {});
+}
+
+bool AudioInputCallbackEndpoint::pushWithPosition(
+    void* context, const float* mono, uint32_t frames,
+    uint64_t sampleHostTimeNs, uint64_t callbackHostTimeNs,
+    AudioInputTimestampQuality timestampQuality,
+    AudioInputSourcePosition sourcePosition) noexcept {
   auto* endpoint = static_cast<AudioInputCallbackEndpoint*>(context);
   if (!endpoint) return false;
-  const bool pushed = endpoint->producer_.push(
-      mono, frames, sampleHostTimeNs, callbackHostTimeNs, timestampQuality);
+  const bool pushed = endpoint->producer_.pushWithPosition(
+      mono, frames, sampleHostTimeNs, callbackHostTimeNs, timestampQuality, sourcePosition);
   if (pushed &&
       !endpoint->notificationPending_.exchange(true, std::memory_order_acq_rel) &&
       endpoint->notify_) {

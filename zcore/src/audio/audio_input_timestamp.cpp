@@ -22,6 +22,12 @@ uint32_t high32(uint64_t value) {
 
 }  // namespace
 
+AudioInputSourcePosition resolveAudioInputSourcePosition(bool sampleTimeValid,
+                                                         double sampleFrame) noexcept {
+  return sampleTimeValid && std::isfinite(sampleFrame)
+      ? AudioInputSourcePosition{sampleFrame, true} : AudioInputSourcePosition{};
+}
+
 uint64_t audioInputCallbackEntryFallback(uint64_t callbackEntryNs,
                                          uint32_t blockFrames,
                                          double sampleRate) noexcept {

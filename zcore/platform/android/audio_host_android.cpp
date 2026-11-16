@@ -317,6 +317,9 @@ class AndroidOboeAudioHostBackend final : public AudioHostBackend {
                        void* renderContext) override {
     std::lock_guard<std::recursive_mutex> api(control_->apiMutex);
     stop();
+    if (config.maximumAcceptableBufferFrames != 0)
+      return {false, AudioHostError::Unsupported, AudioHostState::Unsupported, {}, {},
+              "Buffer negotiation ceilings are unsupported on this platform"};
     if (!ensureErrorWorker(*control_)) {
       return reject(AudioHostError::ProviderFailure,
                     "Android could not start the Oboe error teardown worker");

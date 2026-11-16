@@ -1,6 +1,20 @@
 #include <zcore/device/audio_host.h>
 
+#include <algorithm>
+
 namespace singz {
+
+std::optional<uint32_t> chooseMonitorBufferFrames(
+    const AudioHostBufferRange& inRange, const AudioHostBufferRange& outRange,
+    uint32_t target, uint32_t maximum) noexcept {
+  if (inRange.minimumFrames == 0 || outRange.minimumFrames == 0 ||
+      inRange.maximumFrames < inRange.minimumFrames ||
+      outRange.maximumFrames < outRange.minimumFrames) return std::nullopt;
+  const auto lower = std::max(inRange.minimumFrames, outRange.minimumFrames);
+  const auto upper = std::min({inRange.maximumFrames, outRange.maximumFrames, maximum});
+  if (lower > upper) return std::nullopt;
+  return std::clamp(target, lower, upper);
+}
 
 AudioHost::AudioHost() : backend_(createPlatformAudioHostBackend()) {}
 AudioHost::AudioHost(std::unique_ptr<AudioHostBackend> backend)
@@ -47,6 +61,15 @@ AudioHostResult AudioHost::suspend() {
             {}, {}, "No audio host provider is available"};
   }
   return backend_->suspend();
+}
+
+AudioHostResult AudioHost::setBufferFrames(std::uint32_t frames,
+                                          std::uint32_t maximumAcceptableBufferFrames) {
+  if (backend_ == nullptr) {
+    return {false, AudioHostError::Unsupported, AudioHostState::Unsupported,
+            {}, {}, "No audio host provider is available"};
+  }
+  return backend_->setBufferFrames(frames, maximumAcceptableBufferFrames);
 }
 
 AudioHostResult AudioHost::resume() {

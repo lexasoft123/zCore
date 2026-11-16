@@ -26,6 +26,11 @@ class SINGZ_ZCORE_CALLBACK_LOCAL AudioInputRingProducer {
             AudioInputTimestampQuality timestampQuality =
                 AudioInputTimestampQuality::Unknown) const noexcept;
 
+  bool pushWithPosition(const float* mono, uint32_t frames, uint64_t sampleHostTimeNs,
+                        uint64_t callbackHostTimeNs,
+                        AudioInputTimestampQuality timestampQuality,
+                        AudioInputSourcePosition sourcePosition) const noexcept;
+
  private:
   friend class AudioInputRing;
   explicit AudioInputRingProducer(AudioInputRingCallbackState* state) noexcept
