@@ -2,6 +2,9 @@
 #pragma once
 
 #include <zcore/routing/routing.h>
+#include <atomic>
+#include <array>
+#include <bit>
 
 namespace zcore::routing {
 class SincKernel;
@@ -10,6 +13,52 @@ class MinimumPhaseKernel;
 class UnityConvolutionPlan;
 enum class ResamplingFilter { LinearPhase, MinimumPhase };
 
+enum class ResamplePath : uint32_t {
+    Direct,
+    PhaseTable,
+    CachedExact,
+    Convolution,
+    TiledExact,
+    Invalid,
+    Count
+};
+// Successful immutable table constructions; increments only on the control thread.
+uint64_t sincCoefficientTableConstructions() noexcept;
+struct ResampleDiagnosticsSnapshot {
+    std::array<uint64_t, static_cast<size_t>(ResamplePath::Count)> blocks{};
+    uint32_t lastPathMask{};
+    uint64_t tableMisses{};
+    double cutoff{}, sourceRate{}, outputRate{};
+    // Tables are constructed once on control and remain immutable. There is
+    // no runtime cache eviction, rebuild, or ratio-keyed mutable coefficient cache.
+    uint64_t coefficientTableConstructions{0};
+};
+struct ResampleDiagnostics {
+    std::array<std::atomic<uint64_t>, static_cast<size_t>(ResamplePath::Count)> blocks{};
+    std::atomic<uint32_t> lastPathMask{0};
+    std::atomic<uint64_t> tableMisses{0}, cutoffBits{0}, sourceBits{0}, outputBits{0};
+    void record(uint32_t mask) noexcept {
+        lastPathMask.store(mask, std::memory_order_relaxed);
+        for (size_t index = 0; index < blocks.size(); ++index)
+            if (mask & (1u << index))
+                blocks[index].fetch_add(1, std::memory_order_relaxed);
+    }
+    ResampleDiagnosticsSnapshot snapshot() const noexcept {
+        ResampleDiagnosticsSnapshot result;
+        result.coefficientTableConstructions = sincCoefficientTableConstructions();
+        for (size_t index = 0; index < blocks.size(); ++index)
+            result.blocks[index] = blocks[index].load(std::memory_order_relaxed);
+        result.lastPathMask = lastPathMask.load(std::memory_order_relaxed);
+        result.tableMisses = tableMisses.load(std::memory_order_relaxed);
+        result.cutoff = std::bit_cast<double>(cutoffBits.load(std::memory_order_relaxed));
+        result.sourceRate = std::bit_cast<double>(sourceBits.load(std::memory_order_relaxed));
+        result.outputRate = std::bit_cast<double>(outputBits.load(std::memory_order_relaxed));
+        return result;
+    }
+};
+inline constexpr uint32_t resamplePath(ResamplePath value) noexcept {
+    return 1u << static_cast<uint32_t>(value);
+}
 struct ResamplePosition {
     uint64_t anchor;
     long double offset;
@@ -23,6 +72,8 @@ struct ResamplePosition {
     // Optional fixed source format for minimum-phase filter shape. Sample
     // positions still follow sourceRate; the linear-phase reader ignores it.
     double nominalSourceRate{0};
+    // Optional per-reader instrumentation, allocated by its control owner.
+    ResampleDiagnostics* diagnostics{nullptr};
 };
 struct ResampleFrame {
     bool valid;
