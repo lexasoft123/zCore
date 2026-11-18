@@ -1,4 +1,5 @@
 #include <zcore/device/audio_host.h>
+#include <zcore/device/audio_input_callback_gate.h>
 
 #include <AudioToolbox/AudioToolbox.h>
 #include <CoreAudio/CoreAudio.h>
@@ -12,6 +13,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -48,6 +50,12 @@ struct HostDeviceListenerContext {
   // copy; the backend releases its own copy under the control mutex.
   detail::MacAudioBufferOwnership bufferOwnership;
 };
+
+// Admission gate for renderCallback: entry is counted and admitted in one
+// atomic word, so a callback that races the close in stop() either enters
+// before the drain observes zero or is refused without touching any member.
+// The scope covers the whole callback — preamble, endpoint invocation, and
+// postamble — including the parts endpoint_.inFlight never counted.
 
 // The copied block retains its context. Exceptional failed removal keeps the
 // already-allocated block/queue alive, avoiding stop-time quarantine allocation.
@@ -739,7 +747,9 @@ class MacAudioHostBackend final : public AudioHostBackend {
                      state_.load(std::memory_order_acquire));
     }
     activateAudioHostCallback(&endpoint_);
+    admission_.open();
     if (AudioOutputUnitStart(unit_) != noErr) {
+      admission_.beginClose();
       deactivateAudioHostCallback(&endpoint_);
       return fail(AudioHostError::ProviderFailure, "Could not start AUHAL");
     }
@@ -785,8 +795,15 @@ class MacAudioHostBackend final : public AudioHostBackend {
 
   void stop() noexcept override {
     std::lock_guard lock(controlMutex_);
+    // Close admission first: a callback that has not yet counted itself is
+    // refused here instead of slipping past the drain below, whatever
+    // AudioOutputUnitStop returns. Every callback that did enter must finish
+    // — including its preamble and postamble outside endpoint_.inFlight —
+    // before listener teardown, unit disposal, or any member release below.
+    admission_.beginClose();
     deactivateAudioHostCallback(&endpoint_);
     if (started_ && unit_ != nullptr) AudioOutputUnitStop(unit_);
+    while (admission_.inFlight() != 0) std::this_thread::yield();
     while (endpoint_.inFlight.load(std::memory_order_acquire) != 0) std::this_thread::yield();
     bool removedAll = true;
     for (const auto& [object, address] : watched_) {
@@ -909,6 +926,18 @@ class MacAudioHostBackend final : public AudioHostBackend {
                                  UInt32 frames, AudioBufferList* output) noexcept {
     auto* self = static_cast<MacAudioHostBackend*>(context);
     if (self == nullptr || output == nullptr) return noErr;
+    // Admit-and-count the whole callback, not just invokeAudioHostCallback:
+    // the preamble and postamble also touch members that stop() releases
+    // after draining. A refused entry means stop() is tearing down.
+    AudioInputCallbackScope admission(self->admission_);
+    if (!admission) {
+      for (UInt32 channel = 0; channel < output->mNumberBuffers; ++channel) {
+        auto* bytes = static_cast<uint8_t*>(output->mBuffers[channel].mData);
+        if (bytes != nullptr && output->mBuffers[channel].mDataByteSize > 0)
+          std::memset(bytes, 0, output->mBuffers[channel].mDataByteSize);
+      }
+      return noErr;
+    }
     self->observedCallbackFrames_.store(frames, std::memory_order_relaxed);
     const uint64_t callbackTicks = mach_absolute_time();
     if (frames == 0 || frames > self->format_.maximumFrames ||
@@ -1087,6 +1116,7 @@ class MacAudioHostBackend final : public AudioHostBackend {
   bool allowSharedDeviceBufferChange_{false};
   std::atomic<uint32_t> observedCallbackFrames_{0};
   AudioHostCallbackEndpoint endpoint_{};
+  AudioInputCallbackGate admission_{};
   std::atomic<AudioHostState> state_{AudioHostState::Closed};
   std::atomic<uint64_t> lastRouteGeneration_{0};
   std::atomic<uint64_t> streamGeneration_{0};

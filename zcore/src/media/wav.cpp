@@ -138,6 +138,13 @@ uint16_t le16(const unsigned char* p) { return static_cast<uint16_t>(p[0] | (p[1
 }  // namespace
 
 namespace {
+// The header walk reads only the fmt fields below (the deepest sits at offset
+// 24), but a fmt chunk may legitimately be far larger — a streaming encoder's
+// extension blob. This caps what is read into memory; the rest of an
+// oversized chunk is seeked past, so which files are accepted never depends
+// on the cap.
+constexpr uint32_t kMaximumFmtReadBytes = 4096;
+
 // The header walk both readers share: leaves `f` positioned at the first
 // data byte and reports the format; `frames` is the data chunk's stated
 // count clamped to the bytes actually left in the file (streaming encoders
@@ -169,8 +176,13 @@ bool walkHeader(std::FILE* f, WavHeader& h) {
         h.error = "fmt chunk too short";
         return false;
       }
-      std::vector<unsigned char> fmt(size);
-      if (std::fread(fmt.data(), 1, size, f) != size) {
+      // `size` is the file's own 32-bit count: allocating it in full means a
+      // hostile size (up to 4 GiB) is zero-filled before the short read that
+      // refutes it. Read a bounded prefix — every field the walk reads lives
+      // in the first 26 bytes — and seek over the unread remainder below.
+      const uint32_t readBytes = std::min(size, kMaximumFmtReadBytes);
+      std::vector<unsigned char> fmt(readBytes);
+      if (std::fread(fmt.data(), 1, readBytes, f) != readBytes) {
         h.error = "truncated fmt chunk";
         return false;
       }
@@ -181,6 +193,14 @@ bool walkHeader(std::FILE* f, WavHeader& h) {
       // WAVE_FORMAT_EXTENSIBLE carries the real format in the sub-format GUID.
       if (h.format == 0xFFFE && size >= 26) h.format = le16(fmt.data() + 24);
       haveFmt = true;
+      // The remainder an oversized fmt chunk declared, so the walk resumes at
+      // the chunk's stated end; the pad branch below then composes with this
+      // (it skips off the DECLARED size, as RIFF pads the chunk as declared).
+      if (readBytes < size &&
+          fseeko(f, static_cast<int64_t>(size - readBytes), SEEK_CUR) != 0) {
+        h.error = "truncated fmt chunk";
+        return false;
+      }
       if ((size & 1u) != 0 && fseeko(f, 1, SEEK_CUR) != 0) {
         h.error = "truncated fmt padding";
         return false;

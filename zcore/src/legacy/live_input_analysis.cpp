@@ -48,11 +48,21 @@ LiveInputFrame analyzeLiveInput(const float* mono, size_t frames,
                     : -120.0;
   if (result.rms < 0.01) return result;
 
-  const size_t minTau = std::max<size_t>(
-      2, static_cast<size_t>(std::floor(sampleRate / maxFrequency)));
-  const size_t maxTau = std::min(
-      frames / 2,
-      static_cast<size_t>(std::ceil(sampleRate / minFrequency) + 1));
+  // Clamp in double BEFORE narrowing: sampleRate has no upper bound here and
+  // the frequency bounds only need to be finite and positive, so
+  // sampleRate / maxFrequency (or / minFrequency) can be +inf or exceed
+  // SIZE_MAX, and casting such a double to size_t is UB, not saturation.
+  // Both taus also cap at frames/2 in double, so the casts hold on every
+  // width of size_t. The rejection below is the gate that catches absurd
+  // ratios (minTau > frames/2 - 2) once they are merely large numbers
+  // instead of UB.
+  const double cap = static_cast<double>(frames / 2);
+  const double minTauD = std::floor(sampleRate / maxFrequency);
+  const size_t minTau =
+      minTauD >= 2.0 ? static_cast<size_t>(std::min(std::min(minTauD, 1e18), cap)) : 2;
+  const double maxTauD = std::ceil(sampleRate / minFrequency) + 1.0;
+  const size_t maxTau = static_cast<size_t>(
+      std::min(std::min(maxTauD, 1e18), cap));
   if (maxTau <= minTau + 2) return result;
 
   std::vector<float> difference(maxTau + 1, 0.0f);

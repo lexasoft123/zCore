@@ -407,9 +407,18 @@ void process(void* opaque, const ProcessContext* context,
              const ConstAudioBusView* inputs, uint32_t inputCount,
              const MutableAudioBusView* outputs, uint32_t outputCount) noexcept {
   BuiltinState* state = static_cast<BuiltinState*>(opaque);
-  if (state == nullptr || context == nullptr || outputs == nullptr ||
-      outputCount != 1 || inputCount != state->config.inputBusCount) return;
+  if (outputs == nullptr || outputCount != 1) return;
   const MutableAudioBusView& output = outputs[0];
+  if (state == nullptr || context == nullptr ||
+      inputCount != state->config.inputBusCount) {
+    // The runner copies whatever this call leaves in the output bus
+    // downstream, so a rejected block must still own its output: publish
+    // silence (same zeroing idiom as the oscillator's tail-drain path).
+    for (uint32_t channel = 0; channel < output.channelCount; ++channel)
+      for (uint32_t frame = 0; frame < output.frames.value; ++frame)
+        output.channels[channel][frame] = 0.0f;
+    return;
+  }
   switch (state->config.kind) {
     case BuiltinNodeKind::Gain: processGain(state, context, inputs, output); break;
     case BuiltinNodeKind::ChannelMap: processMap(state, inputs, output); break;

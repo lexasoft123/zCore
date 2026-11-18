@@ -274,12 +274,12 @@ uint32_t inputDiscontinuity(AndroidAudioHostCallbackContext& context,
 
 void AndroidAudioHostTimestampMailbox::reset() noexcept {
   sequence.fetch_add(1, std::memory_order_acq_rel);
-  frameLow.store(0, std::memory_order_relaxed);
-  frameHigh.store(0, std::memory_order_relaxed);
-  timeLow.store(0, std::memory_order_relaxed);
-  timeHigh.store(0, std::memory_order_relaxed);
-  sampledLow.store(0, std::memory_order_relaxed);
-  sampledHigh.store(0, std::memory_order_relaxed);
+  frameLow.store(0, std::memory_order_release);
+  frameHigh.store(0, std::memory_order_release);
+  timeLow.store(0, std::memory_order_release);
+  timeHigh.store(0, std::memory_order_release);
+  sampledLow.store(0, std::memory_order_release);
+  sampledHigh.store(0, std::memory_order_release);
   sequence.fetch_add(1, std::memory_order_release);
 }
 
@@ -289,12 +289,12 @@ bool AndroidAudioHostTimestampMailbox::publish(
   const uint64_t frame = static_cast<uint64_t>(framePosition);
   const uint64_t time = static_cast<uint64_t>(hostTimeNs);
   sequence.fetch_add(1, std::memory_order_acq_rel);
-  frameLow.store(low32(frame), std::memory_order_relaxed);
-  frameHigh.store(high32(frame), std::memory_order_relaxed);
-  timeLow.store(low32(time), std::memory_order_relaxed);
-  timeHigh.store(high32(time), std::memory_order_relaxed);
-  sampledLow.store(low32(sampledAtNs), std::memory_order_relaxed);
-  sampledHigh.store(high32(sampledAtNs), std::memory_order_relaxed);
+  frameLow.store(low32(frame), std::memory_order_release);
+  frameHigh.store(high32(frame), std::memory_order_release);
+  timeLow.store(low32(time), std::memory_order_release);
+  timeHigh.store(high32(time), std::memory_order_release);
+  sampledLow.store(low32(sampledAtNs), std::memory_order_release);
+  sampledHigh.store(high32(sampledAtNs), std::memory_order_release);
   sequence.fetch_add(1, std::memory_order_release);
   return true;
 }
@@ -312,6 +312,10 @@ AndroidAudioHostTimestampProjection AndroidAudioHostTimestampMailbox::project(
     const uint32_t savedTimeHigh = timeHigh.load(std::memory_order_relaxed);
     const uint32_t savedSampledLow = sampledLow.load(std::memory_order_relaxed);
     const uint32_t savedSampledHigh = sampledHigh.load(std::memory_order_relaxed);
+    // Order the payload loads before the sequence re-check; acquire alone does
+    // not order prior relaxed loads (Boehm, "Can Seqlocks Get Along with
+    // Programming Language Memory Models?", MSPC 2012).
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     const uint32_t after = sequence.load(std::memory_order_acquire);
     if (before != after || (after & 1u) != 0) continue;
     return projectAndroidAudioHostTimestamp(

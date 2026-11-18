@@ -14,6 +14,7 @@
 // alias < -30 dB, 14 kHz alias < -60 dB; streamed == one-shot bit for bit.
 // A single-tone SNR at a near-unity ratio says nothing about a decimating
 // ratio, which is how the 2:1 case shipped aliasing for a while.
+// Throws std::invalid_argument unless srcRate > 0, dstRate > 0, channels > 0.
 namespace singz {
 
 class Resampler {

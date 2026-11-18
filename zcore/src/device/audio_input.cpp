@@ -338,11 +338,19 @@ AudioInputResult AudioInput::start(const AudioInputConfig& config, AudioInputSin
     if (!inventory || validateAudioInputConfig(config,*inventory,validationError)) {
       uint64_t generation = nextStreamGeneration.fetch_add(1,std::memory_order_relaxed);
       if (!generation) generation = nextStreamGeneration.fetch_add(1,std::memory_order_relaxed);
-      impl_->callback.clear();
-      impl_->ring = std::make_unique<AudioInputRing>(config.ringBlocks,kMaxCallbackFrames,captureClockDomain(config.deviceUid),generation);
-      impl_->callback.prepare(impl_->ring->producer(),Impl::notifyDelivery,impl_.get());
-      impl_->sink = std::move(sink);
-      impl_->failure.clear();
+      // Build the replacement ring before taking control: move-assigning the
+      // member destroys the retained old ring, and stats()/lastError() read
+      // ring/failure under control. lifecycle -> control is the
+      // lock order every other mutation site already uses.
+      auto nextRing = std::make_unique<AudioInputRing>(config.ringBlocks,kMaxCallbackFrames,captureClockDomain(config.deviceUid),generation);
+      {
+        std::lock_guard<std::mutex> control(impl_->control);
+        impl_->callback.clear();
+        impl_->ring = std::move(nextRing);
+        impl_->callback.prepare(impl_->ring->producer(),Impl::notifyDelivery,impl_.get());
+        impl_->sink = std::move(sink);
+        impl_->failure.clear();
+      }
       impl_->deliveredBlocks.store(0,std::memory_order_relaxed);
       impl_->deliveredFrames.store(0,std::memory_order_relaxed);
       impl_->lastOverruns.store(0,std::memory_order_relaxed);

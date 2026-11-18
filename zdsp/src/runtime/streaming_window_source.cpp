@@ -30,14 +30,17 @@ void publishRange(StreamingWindowRange *range, uint64_t start,
                   uint64_t end) noexcept {
   const uint32_t sequence = range->sequence.load(std::memory_order_relaxed);
   const uint32_t slot = (sequence + 1u) & 1u;
+  // Release payload stores: paired with the reader's seq_cst fence, the
+  // snapshot cannot mix halves even on the abstract machine (Boehm, "Can
+  // Seqlocks Get Along with Programming Language Memory Models?", MSPC 2012).
   range->startLow[slot].store(static_cast<uint32_t>(start),
-                              std::memory_order_relaxed);
+                              std::memory_order_release);
   range->startHigh[slot].store(static_cast<uint32_t>(start >> 32),
-                               std::memory_order_relaxed);
+                               std::memory_order_release);
   range->endLow[slot].store(static_cast<uint32_t>(end),
-                            std::memory_order_relaxed);
+                            std::memory_order_release);
   range->endHigh[slot].store(static_cast<uint32_t>(end >> 32),
-                             std::memory_order_relaxed);
+                             std::memory_order_release);
   range->sequence.store(sequence + 1u, std::memory_order_release);
 }
 
@@ -57,6 +60,10 @@ bool snapshotRange(const StreamingWindowRange *range, uint64_t *start,
     const uint32_t endLow = range->endLow[slot].load(std::memory_order_relaxed);
     const uint32_t endHigh =
         range->endHigh[slot].load(std::memory_order_relaxed);
+    // Order the payload loads before the sequence re-check; acquire alone does
+    // not order prior relaxed loads (Boehm, "Can Seqlocks Get Along with
+    // Programming Language Memory Models?", MSPC 2012).
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     const uint32_t after = range->sequence.load(std::memory_order_acquire);
     if (before == after) {
       *start = (static_cast<uint64_t>(startHigh) << 32) | startLow;
@@ -71,10 +78,12 @@ void publishCursor(StreamingSourceState *state) noexcept {
   const uint32_t sequence =
       state->cursorSequence.load(std::memory_order_relaxed);
   const uint32_t slot = (sequence + 1u) & 1u;
+  // Release payload stores, paired with the reader's seq_cst fence (see
+  // snapshotRange for the reference).
   state->cursorLow[slot].store(static_cast<uint32_t>(state->cursor),
-                               std::memory_order_relaxed);
+                               std::memory_order_release);
   state->cursorHigh[slot].store(static_cast<uint32_t>(state->cursor >> 32),
-                                std::memory_order_relaxed);
+                                std::memory_order_release);
   state->cursorSequence.store(sequence + 1u, std::memory_order_release);
 }
 
@@ -334,6 +343,10 @@ streamingWindowSourceCursor(const ProcessorHandle &processor,
     const uint32_t low = state->cursorLow[slot].load(std::memory_order_relaxed);
     const uint32_t high =
         state->cursorHigh[slot].load(std::memory_order_relaxed);
+    // Order the payload loads before the sequence re-check; acquire alone does
+    // not order prior relaxed loads (Boehm, "Can Seqlocks Get Along with
+    // Programming Language Memory Models?", MSPC 2012).
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     const uint32_t after =
         state->cursorSequence.load(std::memory_order_acquire);
     if (before == after) {

@@ -148,20 +148,35 @@ void consumeEnableAt(ScheduledGainState *state, const ProcessContext &context,
   }
 }
 
+void writeSilence(const MutableAudioBusView &output) noexcept {
+  for (uint32_t channel = 0; channel < output.channelCount; ++channel)
+    for (uint32_t frame = 0; frame < output.frames.value; ++frame)
+      output.channels[channel][frame] = 0.0F;
+}
+
 void process(void *opaque, const ProcessContext *context,
              const ConstAudioBusView *inputs, uint32_t inputCount,
              const MutableAudioBusView *outputs,
              uint32_t outputCount) noexcept {
   auto *state = static_cast<ScheduledGainState *>(opaque);
-  if (state == nullptr || context == nullptr || inputs == nullptr ||
-      outputs == nullptr || inputCount != 1 || outputCount != 1)
+  if (outputs == nullptr || outputCount != 1)
     return;
-  const ConstAudioBusView &input = inputs[0];
   const MutableAudioBusView &output = outputs[0];
+  // Past this point outputs[0] is owned by the call: every remaining
+  // bail-out publishes silence so the runner never copies graph-buffer
+  // leftovers downstream.
+  if (state == nullptr || context == nullptr || inputs == nullptr ||
+      inputCount != 1) {
+    writeSilence(output);
+    return;
+  }
+  const ConstAudioBusView &input = inputs[0];
   if (!state->active || output.frames.value > state->maximumFrames ||
       input.channelCount != output.channelCount ||
-      input.frames.value != output.frames.value)
+      input.frames.value != output.frames.value) {
+    writeSilence(output);
     return;
+  }
   const bool transportValid =
       context->transport != nullptr &&
       (context->transport->validFields & TransportValidProjectSamples) != 0 &&
