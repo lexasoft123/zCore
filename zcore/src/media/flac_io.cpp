@@ -179,8 +179,11 @@ bool walkPcm16(std::FILE* f, int* rate, int* channels, int64_t* frames, std::str
         *err = "fmt chunk too short";
         return false;
       }
-      std::vector<unsigned char> fmt(size);
-      if (std::fread(fmt.data(), 1, size, f) != size) {
+      // Bound the staging read: only fields in the first 26 bytes are used,
+      // and an untrusted 32-bit size must not drive a multi-GiB allocation.
+      const uint32_t readBytes = std::min<uint32_t>(size, 4096);
+      std::vector<unsigned char> fmt(readBytes);
+      if (std::fread(fmt.data(), 1, readBytes, f) != readBytes) {
         *err = "truncated fmt chunk";
         return false;
       }
@@ -190,6 +193,10 @@ bool walkPcm16(std::FILE* f, int* rate, int* channels, int64_t* frames, std::str
       bits = rdLe16(fmt.data() + 14);
       if (format == 0xFFFE && size >= 26) format = rdLe16(fmt.data() + 24);
       haveFmt = true;
+      if (readBytes < size && fseeko(f, static_cast<int64_t>(size) - readBytes, SEEK_CUR) != 0) {
+        *err = "truncated fmt chunk";
+        return false;
+      }
       if ((size & 1u) != 0 && fseeko(f, 1, SEEK_CUR) != 0) {
         *err = "truncated fmt padding";
         return false;

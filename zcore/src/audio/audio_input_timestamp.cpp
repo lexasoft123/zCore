@@ -56,12 +56,12 @@ AudioInputTimestampProjection resolveAudioInputTimestamp(
 
 void AudioInputTimestampProjector::reset() noexcept {
   sequence_.fetch_add(1, std::memory_order_acq_rel);
-  frameLow_.store(0, std::memory_order_relaxed);
-  frameHigh_.store(0, std::memory_order_relaxed);
-  timeLow_.store(0, std::memory_order_relaxed);
-  timeHigh_.store(0, std::memory_order_relaxed);
-  sampledLow_.store(0, std::memory_order_relaxed);
-  sampledHigh_.store(0, std::memory_order_relaxed);
+  frameLow_.store(0, std::memory_order_release);
+  frameHigh_.store(0, std::memory_order_release);
+  timeLow_.store(0, std::memory_order_release);
+  timeHigh_.store(0, std::memory_order_release);
+  sampledLow_.store(0, std::memory_order_release);
+  sampledHigh_.store(0, std::memory_order_release);
   sequence_.fetch_add(1, std::memory_order_release);
 }
 
@@ -76,12 +76,12 @@ bool AudioInputTimestampProjector::publish(int64_t framePosition,
   }
   const uint64_t frame = static_cast<uint64_t>(framePosition);
   sequence_.fetch_add(1, std::memory_order_acq_rel);
-  frameLow_.store(low32(frame), std::memory_order_relaxed);
-  frameHigh_.store(high32(frame), std::memory_order_relaxed);
-  timeLow_.store(low32(time), std::memory_order_relaxed);
-  timeHigh_.store(high32(time), std::memory_order_relaxed);
-  sampledLow_.store(low32(sampledAtNs), std::memory_order_relaxed);
-  sampledHigh_.store(high32(sampledAtNs), std::memory_order_relaxed);
+  frameLow_.store(low32(frame), std::memory_order_release);
+  frameHigh_.store(high32(frame), std::memory_order_release);
+  timeLow_.store(low32(time), std::memory_order_release);
+  timeHigh_.store(high32(time), std::memory_order_release);
+  sampledLow_.store(low32(sampledAtNs), std::memory_order_release);
+  sampledHigh_.store(high32(sampledAtNs), std::memory_order_release);
   sequence_.fetch_add(1, std::memory_order_release);
   return true;
 }
@@ -126,6 +126,10 @@ bool AudioInputTimestampProjector::snapshot(Snapshot& out) const noexcept {
     const uint32_t timeHigh = timeHigh_.load(std::memory_order_relaxed);
     const uint32_t sampledLow = sampledLow_.load(std::memory_order_relaxed);
     const uint32_t sampledHigh = sampledHigh_.load(std::memory_order_relaxed);
+    // Order the payload loads before the sequence re-check; acquire alone does
+    // not order prior relaxed loads (Boehm, "Can Seqlocks Get Along with
+    // Programming Language Memory Models?", MSPC 2012).
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     const uint32_t after = sequence_.load(std::memory_order_acquire);
     if (before != after || (after & 1u) != 0) continue;
     out.framePosition = joinSigned(frameLow, frameHigh);

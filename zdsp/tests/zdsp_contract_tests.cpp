@@ -324,6 +324,14 @@ void prepareTopologyAndLifecycle() {
   expect(!succeeded(validatePrepareSpec(spec)), "reject NaN sample rate");
   spec.sampleRate.value = std::numeric_limits<double>::infinity();
   expect(!succeeded(validatePrepareSpec(spec)), "reject infinite sample rate");
+  spec.sampleRate.value = 0.5;
+  expect(validatePrepareSpec(spec).code == StatusCode::InvalidArgument,
+         "reject sub-hertz sample rate");
+  spec.sampleRate.value = 1e-30;
+  expect(validatePrepareSpec(spec).code == StatusCode::InvalidArgument,
+         "reject degenerate sample rate");
+  spec.sampleRate.value = 1.0;
+  expect(succeeded(validatePrepareSpec(spec)), "accept the 1Hz rate floor");
   spec.sampleRate.value = 48000.0;
   spec.inputBuses = nullptr;
   expect(!succeeded(validatePrepareSpec(spec)), "reject missing topology array");

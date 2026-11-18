@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <numeric>
+#include <stdexcept>
+#include <string>
 
 namespace singz {
 namespace {
@@ -23,6 +25,20 @@ double besselI0(double x) {
 }  // namespace
 
 Resampler::Resampler(int srcRate, int dstRate, int channels) : channels_(channels) {
+  // A zero or negative rate or channel count does not merely degrade: gcd(0,0)
+  // divides by zero, up_/down_ == 0 stalls the process() phase loop or wraps
+  // filter_ sizing, and a negative polyphase index reads filter_ out of
+  // bounds. Every in-tree caller validates before constructing; this gate
+  // turns a bad argument into a catchable exception instead of UB.
+  if (srcRate <= 0)
+    throw std::invalid_argument(
+        "Resampler: srcRate must be > 0, got " + std::to_string(srcRate));
+  if (dstRate <= 0)
+    throw std::invalid_argument(
+        "Resampler: dstRate must be > 0, got " + std::to_string(dstRate));
+  if (channels <= 0)
+    throw std::invalid_argument(
+        "Resampler: channels must be > 0, got " + std::to_string(channels));
   const int g = std::gcd(srcRate, dstRate);
   up_ = dstRate / g;
   down_ = srcRate / g;
@@ -91,6 +107,13 @@ Resampler::Resampler(int srcRate, int dstRate, int channels) : channels_(channel
 }
 
 void Resampler::process(const float* in, int64_t frames, std::vector<float>& out) {
+  // A negative count would form pointers before `in` in both branches (the
+  // passthrough insert and the work_ copy) and wrap the work_ resize to a
+  // huge size_t, so both return here with state untouched. A zero-frame
+  // call is equivalent: it would only re-copy the history unchanged (a
+  // first zero-frame call additionally defers its primed-history output to
+  // the next call, which no caller relies on).
+  if (frames <= 0) return;
   if (passthrough()) {
     out.insert(out.end(), in, in + frames * channels_);
     return;

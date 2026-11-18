@@ -96,8 +96,12 @@ bool isValid(const AudioBusDescriptor& descriptor) noexcept {
 Status validatePrepareSpec(const PrepareSpec& spec) noexcept {
   if (spec.interfaceVersion != kProcessorInterfaceVersion)
     return {StatusCode::VersionMismatch, spec.interfaceVersion};
+  // Rates must stay at or above 1.0 Hz: graph_runner converts host-time deltas
+  // through 1e9/rate (captureContinues/offsetNanoseconds), and below ~5.4e-11 Hz
+  // that quotient no longer fits uint64, making the float->integer cast UB.
+  // Real audio rates (8k-768k in-tree) are far above this floor.
   if (spec.structSize < kPrepareSpecV1RequiredSize || !std::isfinite(spec.sampleRate.value) ||
-      spec.sampleRate.value <= 0.0 || spec.maximumBlockFrames.value == 0 ||
+      spec.sampleRate.value < 1.0 || spec.maximumBlockFrames.value == 0 ||
       spec.inputBusCount > kMaximumBusesPerProcessor ||
       spec.outputBusCount > kMaximumBusesPerProcessor ||
       (spec.inputBusCount != 0 && spec.inputBuses == nullptr) ||
@@ -116,8 +120,11 @@ Status validatePrepareSpec(const PrepareSpec& spec) noexcept {
 Status validateProcessContext(const ProcessContext& context) noexcept {
   if (context.interfaceVersion != kProcessContextInterfaceVersion)
     return {StatusCode::VersionMismatch, context.interfaceVersion};
+  // Same 1.0 Hz floor as validatePrepareSpec: it keeps the 1e9/rate
+  // conversions in graph_runner (captureContinues/offsetNanoseconds) inside
+  // uint64 range, so their float->integer casts stay defined.
   if (context.structSize < kProcessContextV1RequiredSize ||
-      !std::isfinite(context.sampleRate.value) || context.sampleRate.value <= 0.0 ||
+      !std::isfinite(context.sampleRate.value) || context.sampleRate.value < 1.0 ||
       context.parameterCount > kMaximumEventsPerBlock ||
       context.eventCount > kMaximumEventsPerBlock ||
       (context.parameterCount != 0 && context.parameters == nullptr) ||

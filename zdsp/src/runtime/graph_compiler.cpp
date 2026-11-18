@@ -72,7 +72,7 @@ Status compileGraph(const GraphDescription& description, RealtimeArena* arena,
   *result = {};
   const ArenaCheckpoint before = checkpoint(*arena);
   if (description.formatVersion != kGraphFormatVersion ||
-      !std::isfinite(description.sampleRate.value) || description.sampleRate.value <= 0.0 ||
+      !std::isfinite(description.sampleRate.value) || description.sampleRate.value < 1.0 ||
       description.maximumBlockFrames.value == 0 || description.nodes == nullptr ||
       description.nodeCount == 0 || description.nodeCount > kMaximumGraphNodes ||
       description.connectionCount > kMaximumGraphConnections ||

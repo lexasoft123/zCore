@@ -1,4 +1,5 @@
 #include <zcore/device/audio_input_backend.h>
+#include <zcore/device/audio_input_callback_gate.h>
 #include <zcore/device/audio_input_ios_session.h>
 
 #if defined(__APPLE__)
@@ -17,6 +18,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -35,6 +37,10 @@ constexpr uint32_t kMediaServicesReset = 1u << 3;
 struct SessionSignals {
   std::atomic<uint32_t> pending{0};
 };
+
+// Admission gate for renderCallback: entry is counted and admitted in one
+// atomic word, so a callback that races the close in stop() either enters
+// before the drain observes zero or is refused without touching any member.
 
 std::string nsString(NSString* value) {
   if (!value) return {};
@@ -219,8 +225,12 @@ class IosAudioInputBackend final : public AudioInputBackend {
                                ? "iOS audio route changed before capture started"
                                : std::move(readinessError),
                            channel_);
+      admission_.open();
       const OSStatus status = AudioOutputUnitStart(unit_);
-      if (status != noErr) return fail("start RemoteIO", status, channel_);
+      if (status != noErr) {
+        admission_.beginClose();
+        return fail("start RemoteIO", status, channel_);
+      }
       started_ = true;
       if (!sessionStillReady(readinessError) || pendingChanges() != 0)
         return failMessage(readinessError.empty()
@@ -235,7 +245,16 @@ class IosAudioInputBackend final : public AudioInputBackend {
     @autoreleasepool {
       removeObservers();
       if (unit_) {
+        // Close admission before the stop: a callback that has not yet
+        // counted itself is refused instead of slipping past the drain,
+        // whatever the stop returns or whether the unit was ever started.
+        // Any callback that did enter must finish before the unit is
+        // disposed or the members it reads are cleared below.
+        admission_.beginClose();
         if (started_) AudioOutputUnitStop(unit_);
+        while (admission_.inFlight() != 0) {
+          std::this_thread::yield();
+        }
         if (initialized_) AudioUnitUninitialize(unit_);
         AudioComponentInstanceDispose(unit_);
       }
@@ -364,7 +383,14 @@ class IosAudioInputBackend final : public AudioInputBackend {
                                  UInt32 frames, AudioBufferList*) {
     const uint64_t callbackTicks = mach_absolute_time();
     IosAudioInputBackend* self = static_cast<IosAudioInputBackend*>(context);
-    if (!self || !self->unit_ || !self->push_ || frames == 0) return noErr;
+    if (!self) return noErr;
+    // Admit-and-count the whole callback before touching any member: stop()
+    // closes admission and drains before disposing the unit or clearing
+    // renderBuffer_/push_ below. A refused entry means teardown is under
+    // way; drop the block.
+    AudioInputCallbackScope admission(self->admission_);
+    if (!admission) return noErr;
+    if (!self->unit_ || !self->push_ || frames == 0) return noErr;
     if (frames > self->renderBuffer_.size()) {
       self->callbackFailure_.store(kCallbackTooLarge,
                                    std::memory_order_release);
@@ -422,6 +448,7 @@ class IosAudioInputBackend final : public AudioInputBackend {
   AudioInputPush push_ = nullptr;
   void* context_ = nullptr;
   std::atomic<int32_t> callbackFailure_{0};
+  AudioInputCallbackGate admission_{};
   std::string selectedUid_;
   std::shared_ptr<SessionSignals> signals_;
   id routeObserver_ = nil;

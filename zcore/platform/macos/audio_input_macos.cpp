@@ -1,4 +1,5 @@
 #include <zcore/device/audio_input_backend.h>
+#include <zcore/device/audio_input_callback_gate.h>
 
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
@@ -48,6 +49,11 @@ struct DeviceListenerContext {
   std::atomic<bool> latencyStable{true};
   std::atomic<uint64_t> latencyRevision{0};
 };
+
+// Admission gate for renderCallback: entry is counted and admitted in one
+// atomic word, so a callback that races the close in stop()/suspendPrepared()
+// either enters before the drain observes zero or is refused without reading
+// unit_, push_ or renderBuffer_.
 
 // The copied listener block owns its shared context. Failed removal retains
 // the already-allocated block/queue until process exit, without allocating on stop.
@@ -467,21 +473,37 @@ class MacAudioInputBackend final : public AudioInputBackend {
       return failMessage("audio input stream configuration changed; restart capture", channel_);
     renderRecovery_ = {};
     renderSliceDrops_.store(0, std::memory_order_relaxed);
+    admission_.open();
     const OSStatus status = AudioOutputUnitStart(unit_);
-    if (status != noErr) return fail("start AUHAL", status, channel_);
+    if (status != noErr) {
+      admission_.beginClose();
+      return fail("start AUHAL", status, channel_);
+    }
     started_ = true;
     return resultWithLatency(AudioInputState::Running);
   }
 
   bool suspendPrepared() override {
-    return detail::suspendMacAudioInputPrepared(unit_ && initialized_, started_, [this] {
+    // Close admission before the stop inside the transaction: a callback that
+    // has not yet counted itself is refused instead of slipping past the
+    // drain, whatever AudioOutputUnitStop returns.
+    admission_.beginClose();
+    const bool suspended = detail::suspendMacAudioInputPrepared(unit_ && initialized_, started_, [this] {
       return AudioOutputUnitStop(unit_) == noErr;
     });
+    // The suspended unit's last callback must finish before control returns:
+    // the caller then replaces the ring/endpoint that callback wrote into.
+    while (admission_.inFlight() != 0) std::this_thread::yield();
+    return suspended;
   }
 
   void stop() noexcept override {
     bool removedAll = true;
-    if (selectedDevice_ != kAudioObjectUnknown && listenerContext_) {
+    // Mirror the host backend: a failed dispatch_queue_create/Block_copy in
+    // open() leaves a null queue/block with no registered listeners, so
+    // dispatch_sync_f/dispatch_release/Block_release must all be skipped.
+    if (selectedDevice_ != kAudioObjectUnknown && listenerContext_ &&
+        listenerQueue_ != nullptr && listenerBlock_ != nullptr) {
       for (const auto& [object, property] : watchedProperties_) {
         if (AudioObjectRemovePropertyListenerBlock(object, &property,
                                                    listenerQueue_, listenerBlock_) != noErr)
@@ -497,14 +519,24 @@ class MacAudioInputBackend final : public AudioInputBackend {
       }
       // On failed removal the retained block pins its captured shared context;
       // deliberately retain our block/queue references, without a heap push.
-
+    } else if (listenerQueue_ != nullptr) {
+      // A queue that never received its block has nothing registered to it;
+      // only the queue reference remains, so release it (host backend parity).
+      dispatch_release(listenerQueue_);
     }
     watchedProperties_.clear();
     listenerContext_.reset();
     listenerQueue_ = nullptr;
     listenerBlock_ = nullptr;
     if (unit_) {
+      // Close admission before the stop: a callback that has not yet counted
+      // itself is refused instead of slipping past the drain, whatever the
+      // stop returns or whether the unit was ever started. Any callback that
+      // did enter must finish before the unit is disposed or the members it
+      // reads are cleared.
+      admission_.beginClose();
       if (started_) AudioOutputUnitStop(unit_);
+      while (admission_.inFlight() != 0) std::this_thread::yield();
       if (initialized_) AudioUnitUninitialize(unit_);
       AudioComponentInstanceDispose(unit_);
     }
@@ -634,7 +666,14 @@ class MacAudioInputBackend final : public AudioInputBackend {
                                  UInt32 frames, AudioBufferList*) {
     const uint64_t callbackTicks = mach_absolute_time();
     MacAudioInputBackend* self = static_cast<MacAudioInputBackend*>(context);
-    if (!self || !self->unit_ || !self->push_ || frames == 0)
+    if (!self) return noErr;
+    // Admit-and-count the whole callback before touching any member: stop()
+    // and suspendPrepared() close admission and drain before disposing the
+    // unit or clearing unit_/renderBuffer_/push_/context_ read below. A
+    // refused entry means teardown is under way; drop the block.
+    AudioInputCallbackScope admission(self->admission_);
+    if (!admission) return noErr;
+    if (!self->unit_ || !self->push_ || frames == 0)
       return noErr;
     if (detail::macAudioInputCallbackTooLarge(frames, self->renderMaximumFrames_)) {
       self->callbackFailure_.store(kCallbackTooLarge, std::memory_order_release);
@@ -722,6 +761,7 @@ class MacAudioInputBackend final : public AudioInputBackend {
   std::atomic<int32_t> callbackFailure_{0};
   detail::MacInputRenderRecovery renderRecovery_;
   std::atomic<uint64_t> renderSliceDrops_{0};
+  AudioInputCallbackGate admission_{};
   std::shared_ptr<DeviceListenerContext> listenerContext_;
   dispatch_queue_t listenerQueue_ = nullptr;
   AudioObjectPropertyListenerBlock listenerBlock_ = nullptr;

@@ -160,7 +160,10 @@ CaptureTime offsetCapture(CaptureTime capture, uint32_t offset,
   }
   if ((capture.flags & CaptureTimeSampleHostValid) != 0) {
     const uint64_t delta = offsetNanoseconds(offset, rate);
-    if (capture.sampleHostTime.value > UINT64_MAX - delta)
+    // A saturated offset is not a representable host time: withdraw validity
+    // exactly like the overflow branch below instead of publishing garbage.
+    if (delta == UINT64_MAX ||
+        capture.sampleHostTime.value > UINT64_MAX - delta)
       capture.flags &= ~CaptureTimeSampleHostValid;
     else
       capture.sampleHostTime.value += delta;
@@ -195,6 +198,12 @@ bool captureContinues(const CaptureTime& previous, const CaptureTime& next,
     if (next.sampleHostTime.value <= previous.sampleHostTime.value) return false;
     const uint64_t delta = next.sampleHostTime.value - previous.sampleHostTime.value;
     const double exact = 1000000000.0 / rate.value;
+    // Defense in depth for the uint64 casts below: converting a double that
+    // cannot fit the target integer type is UB. Guard with pure comparisons
+    // (the 1.0 Hz contract floor already rejects such rates; NaN and negative
+    // rates fail these tests too) and treat an unrepresentable sample period
+    // as a discontinuity.
+    if (!(rate.value >= 1.0e-9) || exact >= 1.8e19) return false;
     const uint64_t lower = static_cast<uint64_t>(std::floor(exact));
     const uint64_t upper = static_cast<uint64_t>(std::ceil(exact));
     if (delta < lower || delta > upper) return false;
@@ -555,6 +564,10 @@ uint32_t drainLatestParameters(ParameterQueue* queue, ParameterEvent* selected,
                                uint32_t capacity, FrameCount frames,
                                uint32_t available,
                                uint32_t* coalesced) noexcept {
+  // ordinals below is a fixed block-sized array; clamp a larger caller
+  // capacity so it stays in bounds (all callers pass exactly
+  // kMaximumEventsPerBlock today).
+  if (capacity > kMaximumEventsPerBlock) capacity = kMaximumEventsPerBlock;
   uint32_t ordinals[kMaximumEventsPerBlock]{};
   uint32_t count = 0;
   bool overloaded = false;
@@ -653,6 +666,9 @@ uint32_t drainLatestMusicalEvents(MusicalEventQueue* queue,
                                   FrameCount frames,
                                   uint32_t available,
                                   uint32_t* discarded) noexcept {
+  // Same clamp as drainLatestParameters: ordinals is a fixed block-sized
+  // array and must not be indexed past kMaximumEventsPerBlock.
+  if (capacity > kMaximumEventsPerBlock) capacity = kMaximumEventsPerBlock;
   uint32_t count = 0;
   uint32_t ordinals[kMaximumEventsPerBlock]{};
   uint32_t ordinal = 0;
@@ -732,8 +748,16 @@ void recordHistory(GraphRunner* runner, const MutableAudioBusView* outputs,
 }
 
 uint64_t offsetNanoseconds(uint32_t frames, SampleRateHz rate) noexcept {
-  return static_cast<uint64_t>(std::llround(
-      static_cast<double>(frames) * 1000000000.0 / rate.value));
+  const double nanoseconds =
+      static_cast<double>(frames) * 1000000000.0 / rate.value;
+  // Defense in depth against a sub-floor or hostile rate reaching this
+  // conversion directly: saturate instead of letting std::llround receive a
+  // quotient outside long long range (unspecified result). The bound sits
+  // below INT64_MAX yet above every in-contract block (UINT32_MAX frames at
+  // the 1.0 Hz floor is ~4.3e18 ns); callers treat UINT64_MAX as "not
+  // representable" and withdraw host-time validity.
+  if (!(nanoseconds >= 0.0 && nanoseconds <= 9.2e18)) return UINT64_MAX;
+  return static_cast<uint64_t>(std::llround(nanoseconds));
 }
 
 bool advanceSignedSamples(int64_t value, uint32_t offset,
@@ -818,8 +842,16 @@ ProcessContext segmentContext(const ProcessContext& source, uint32_t offset,
   ProcessContext segment = source;
   segment.frames = {frames};
   segment.time.graphFrame.value += offset;
-  if ((segment.time.flags & RenderTimeHostValid) != 0)
-    segment.time.renderHostTime.value += offsetNanoseconds(offset, source.sampleRate);
+  if ((segment.time.flags & RenderTimeHostValid) != 0) {
+    // A saturated offset or an overflowing sum withdraws host-time validity
+    // rather than wrapping the timeline (same convention as offsetCapture).
+    const uint64_t offsetNs = offsetNanoseconds(offset, source.sampleRate);
+    if (offsetNs == UINT64_MAX ||
+        segment.time.renderHostTime.value > UINT64_MAX - offsetNs)
+      segment.time.flags &= ~RenderTimeHostValid;
+    else
+      segment.time.renderHostTime.value += offsetNs;
+  }
   if (offset != 0 || tailDrain) {
     segment.time.flags &= ~RenderTimeDiscontinuous;
     segment.discontinuity = {DiscontinuityReason::None,
@@ -934,6 +966,10 @@ void adoptClaimed(GraphRunner* runner, PublishedGraphSnapshot* next) noexcept {
     return;
   }
   const uint32_t index = next->reservedRetirementSlot;
+  // Mirrors rejectClaimed/releaseReservation: a reservation outside the slot
+  // array cannot carry the old graph's ownership to reclamation, so the claim
+  // is rejected (not adopted) and rendering continues on the active graph.
+  if (index >= runner->publisher->retirementCapacity) return;
   RetirementSlot& slot = runner->publisher->retirementSlots[index];
   if (next->transition.kind == TransitionKind::Crossfade) {
     primeAlignment(runner, *next);
@@ -1631,12 +1667,18 @@ Status renderGraphBlockImpl(GraphRunner* runner, ProcessContext context,
     runner->fadingFrom = nullptr;
     runner->oldPathEnvelope = 0.0f;
     runner->publisher->fadingView.store(nullptr, std::memory_order_release);
-    RetirementSlot& slot = runner->publisher->retirementSlots[
-        runner->active->reservedRetirementSlot];
-    slot.snapshot.store(retired, std::memory_order_relaxed);
-    slot.retireAfterEpoch = epoch;
-    slot.state.store(static_cast<uint32_t>(RetirementSlotState::Waiting),
-                     std::memory_order_release);
+    // Mirrors markRetirementReady: a reservation outside the slot array has
+    // nothing to publish into, so the retire-store is skipped entirely.
+    const uint32_t retirementIndex =
+        runner->active->reservedRetirementSlot;
+    if (retirementIndex < runner->publisher->retirementCapacity) {
+      RetirementSlot& slot = runner->publisher->retirementSlots[
+          retirementIndex];
+      slot.snapshot.store(retired, std::memory_order_relaxed);
+      slot.retireAfterEpoch = epoch;
+      slot.state.store(static_cast<uint32_t>(RetirementSlotState::Waiting),
+                       std::memory_order_release);
+    }
   }
   recordHistory(runner, outputs, outputCount);
   return okStatus();

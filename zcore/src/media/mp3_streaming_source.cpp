@@ -481,11 +481,30 @@ DecodedAudioStatus Mp3FrameDecoder::decode(const Mp3Frame& frame, const Mp3Layou
                                            float* interleaved) noexcept {
   const unsigned char* bytes = nullptr;
   size_t got = 0;
-  if (frame.bytes > kMaximumFrameBytes) return DecodedAudioStatus::MalformedData;
+  // The lower bound makes the header reads below defined: the window vouches
+  // for exactly `frame.bytes` bytes, and both parseHeader and the priming copy
+  // take four of them.
+  if (frame.bytes < kHeaderBytes || frame.bytes > kMaximumFrameBytes)
+    return DecodedAudioStatus::MalformedData;
   if (!state_->window.at(frame.offset, frame.bytes, &bytes, &got))
     return DecodedAudioStatus::IoError;
   // Indexed at open, so a short read is a file that shrank since.
   if (got != frame.bytes) return DecodedAudioStatus::IoError;
+  // TOCTOU: the index — and the caller's buffer, sized samplesPerFrame x
+  // channels from it — was built at open from these same bytes, but dr_mp3
+  // sizes its OUTPUT from the header it parses NOW, and the header it compares
+  // frame to frame ignores byte 3, so a same-length in-place rewrite of the
+  // file between open and decode (MPEG-1 for MPEG-2, or stereo for mono —
+  // both can leave the frame size standing) would have it write past that
+  // buffer before any sample-count check could run. So the header is parsed
+  // again, from the bytes just read, and must still describe the indexed
+  // stream: sampleRate plus samplesPerFrame pin version and rate, channels
+  // and bytes pin the rest of what dr_mp3's output size depends on.
+  FrameHeader fresh;
+  if (!parseHeader(bytes, &fresh) || fresh.sampleRate != layout.sampleRate ||
+      fresh.channels != layout.channels ||
+      fresh.samplesPerFrame != layout.samplesPerFrame || fresh.bytes != frame.bytes)
+    return DecodedAudioStatus::MalformedData;
   drmp3dec& decoder = state_->decoder;
   // dr_mp3 resynchronises by SEARCHING when it has no previous header, which
   // needs several frames of lookahead. Every frame here is already known to
