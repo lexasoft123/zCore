@@ -42,8 +42,10 @@ struct SessionSignals {
 // atomic word, so a callback that races the close in stop() either enters
 // before the drain observes zero or is refused without touching any member.
 // The gate is heap-allocated and registered with the HAL in place of `this`
-// so it can outlive the backend; stop() frees it only after a fully clean
-// teardown and deliberately leaks it otherwise.
+// so an UNCLEAN teardown can quarantine it: the leaked context keeps the
+// gate readable, so a late callback there is refused instead of touching
+// freed memory. A fully clean teardown frees it and accepts the platform's
+// Dispose contract as the boundary beyond this defense.
 
 std::string nsString(NSString* value) {
   if (!value) return {};
@@ -268,15 +270,20 @@ class IosAudioInputBackend final : public AudioInputBackend {
         if (initialized_ && AudioUnitUninitialize(unit_) != noErr) teardownClean = false;
         if (AudioComponentInstanceDispose(unit_) != noErr) teardownClean = false;
         if (callbackGate_) {
-          // Free the HAL-reachable context only after a fully clean teardown:
-          // a late callback after that trusts the documented Dispose
-          // boundary. Any failure leaks the context on purpose so a
-          // misbehaving HAL reads a closed gate instead of freed memory.
+          // Free the HAL-reachable context only after a fully clean teardown;
+          // a callback past that point is beyond this defense, and the
+          // platform's Dispose contract is the accepted boundary there. Any
+          // failure leaks the context on purpose so a misbehaving HAL reads
+          // a closed gate instead of freed memory; the leaked gate still
+          // drops its owner pointer when quiescent so nothing dangles
+          // behind the quarantine.
           teardownClean = teardownClean && callbackGate_->clearOwnerIfQuiescent();
           if (teardownClean)
             callbackGate_.reset();
-          else
+          else {
+            (void)callbackGate_->clearOwnerIfQuiescent();
             callbackGate_.release();
+          }
         }
       }
       unit_ = nullptr;
@@ -469,12 +476,11 @@ class IosAudioInputBackend final : public AudioInputBackend {
   AudioInputPush push_ = nullptr;
   void* context_ = nullptr;
   std::atomic<int32_t> callbackFailure_{0};
-  // Registered with the HAL in place of `this` so it can outlive the
-  // backend: a late callback after destruction reads the gate (refused)
-  // instead of freed backend memory, and an unclean teardown leaks it (the
-  // iOS host's poison-lease idiom).
+  // Registered with the HAL in place of `this`; see the comment above the
+  // backend for the quarantine/outliving contract.
   using CallbackGate = AudioInputCallbackOwnerGate<IosAudioInputBackend>;
-  std::unique_ptr<CallbackGate> callbackGate_;  std::string selectedUid_;
+  std::unique_ptr<CallbackGate> callbackGate_;
+  std::string selectedUid_;
   std::shared_ptr<SessionSignals> signals_;
   id routeObserver_ = nil;
   id interruptionObserver_ = nil;

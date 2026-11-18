@@ -54,11 +54,12 @@ struct HostDeviceListenerContext {
 // Admission gate for renderCallback: entry is counted and admitted in one
 // atomic word, so a callback that races the close in stop() either enters
 // before the drain observes zero or is refused without touching any member.
-// The gate is heap-allocated and registered with the HAL in place of `this`,
-// so it can outlive the backend: a late callback after destruction reads the
-// gate (refused) instead of freed backend memory. stop() frees it only after
-// a fully clean teardown; any failure deliberately leaks it (quarantine, the
-// iOS host's poison-lease idiom). The scope covers the whole callback —
+// The gate is heap-allocated and registered with the HAL in place of `this`
+// so an UNCLEAN teardown can quarantine it: the leaked context keeps the
+// gate readable, so a late callback there is refused instead of touching
+// freed memory. A fully clean teardown frees it and accepts the platform's
+// Dispose contract as the boundary beyond this defense (the iOS host's
+// poison-lease idiom). The scope covers the whole callback —
 // preamble, endpoint invocation, and postamble — including the parts
 // endpoint_.inFlight never counted.
 
@@ -865,16 +866,20 @@ class MacAudioHostBackend final : public AudioHostBackend {
     if (unit_ != nullptr && AudioComponentInstanceDispose(unit_) != noErr)
       teardownClean = false;
     if (callbackGate_) {
-      // Free the HAL-reachable context only after a fully clean teardown: a
-      // late callback after that trusts the documented Dispose boundary. Any
-      // failure (or a non-quiescent gate) leaks the context on purpose so a
-      // misbehaving HAL reads a closed gate instead of freed memory — the
-      // iOS host's poison-lease idiom.
+      // Free the HAL-reachable context only after a fully clean teardown; a
+      // callback past that point is beyond this defense, and the platform's
+      // Dispose contract is the accepted boundary there. Any failure (or a
+      // non-quiescent gate) leaks the context on purpose so a misbehaving
+      // HAL reads a closed gate instead of freed memory — the iOS host's
+      // poison-lease idiom. The leaked gate still drops its owner pointer
+      // when quiescent so nothing dangles behind the quarantine.
       teardownClean = teardownClean && callbackGate_->clearOwnerIfQuiescent();
       if (teardownClean)
         callbackGate_.reset();
-      else
+      else {
+        (void)callbackGate_->clearOwnerIfQuiescent();
         callbackGate_.release();
+      }
     }
     detail::MacAudioBufferProperties bufferProperties{selectedDevice_, selectedDeviceUid_};
     if (bufferOwnership_.token != 0) {
