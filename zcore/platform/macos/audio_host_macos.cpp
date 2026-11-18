@@ -54,8 +54,13 @@ struct HostDeviceListenerContext {
 // Admission gate for renderCallback: entry is counted and admitted in one
 // atomic word, so a callback that races the close in stop() either enters
 // before the drain observes zero or is refused without touching any member.
-// The scope covers the whole callback — preamble, endpoint invocation, and
-// postamble — including the parts endpoint_.inFlight never counted.
+// The gate is heap-allocated and registered with the HAL in place of `this`,
+// so it can outlive the backend: a late callback after destruction reads the
+// gate (refused) instead of freed backend memory. stop() frees it only after
+// a fully clean teardown; any failure deliberately leaks it (quarantine, the
+// iOS host's poison-lease idiom). The scope covers the whole callback —
+// preamble, endpoint invocation, and postamble — including the parts
+// endpoint_.inFlight never counted.
 
 // The copied block retains its context. Exceptional failed removal keeps the
 // already-allocated block/queue alive, avoiding stop-time quarantine allocation.
@@ -628,7 +633,11 @@ class MacAudioHostBackend final : public AudioHostBackend {
     endpoint_.invalidCallbacks.store(0, std::memory_order_relaxed);
     endpoint_.renderFailures.store(0, std::memory_order_relaxed);
     prepareAudioHostCallback(&endpoint_, render, renderContext);
-    AURenderCallbackStruct callback{renderCallback, this};
+    // The heap gate is the HAL's callback context so it can be quarantined
+    // past backend destruction on an unclean teardown.
+    callbackGate_ = std::make_unique<CallbackGate>();
+    callbackGate_->open(this);
+    AURenderCallbackStruct callback{renderCallback, callbackGate_.get()};
     if (AudioUnitSetProperty(unit_, kAudioUnitProperty_SetRenderCallback,
                              kAudioUnitScope_Input, 0, &callback,
                              sizeof(callback)) != noErr ||
@@ -747,9 +756,8 @@ class MacAudioHostBackend final : public AudioHostBackend {
                      state_.load(std::memory_order_acquire));
     }
     activateAudioHostCallback(&endpoint_);
-    admission_.open();
     if (AudioOutputUnitStart(unit_) != noErr) {
-      admission_.beginClose();
+      if (callbackGate_) callbackGate_->beginClose();
       deactivateAudioHostCallback(&endpoint_);
       return fail(AudioHostError::ProviderFailure, "Could not start AUHAL");
     }
@@ -800,10 +808,13 @@ class MacAudioHostBackend final : public AudioHostBackend {
     // AudioOutputUnitStop returns. Every callback that did enter must finish
     // — including its preamble and postamble outside endpoint_.inFlight —
     // before listener teardown, unit disposal, or any member release below.
-    admission_.beginClose();
+    if (callbackGate_) callbackGate_->beginClose();
     deactivateAudioHostCallback(&endpoint_);
-    if (started_ && unit_ != nullptr) AudioOutputUnitStop(unit_);
-    while (admission_.inFlight() != 0) std::this_thread::yield();
+    bool teardownClean = true;
+    if (started_ && unit_ != nullptr && AudioOutputUnitStop(unit_) != noErr) teardownClean = false;
+    if (callbackGate_) {
+      while (callbackGate_->inFlight() != 0) std::this_thread::yield();
+    }
     while (endpoint_.inFlight.load(std::memory_order_acquire) != 0) std::this_thread::yield();
     bool removedAll = true;
     for (const auto& [object, address] : watched_) {
@@ -849,8 +860,22 @@ class MacAudioHostBackend final : public AudioHostBackend {
     listenerContext_.reset();
     listenerQueue_ = nullptr;
     listenerBlock_ = nullptr;
-    if (initialized_ && unit_ != nullptr) AudioUnitUninitialize(unit_);
-    if (unit_ != nullptr) AudioComponentInstanceDispose(unit_);
+    if (initialized_ && unit_ != nullptr && AudioUnitUninitialize(unit_) != noErr)
+      teardownClean = false;
+    if (unit_ != nullptr && AudioComponentInstanceDispose(unit_) != noErr)
+      teardownClean = false;
+    if (callbackGate_) {
+      // Free the HAL-reachable context only after a fully clean teardown: a
+      // late callback after that trusts the documented Dispose boundary. Any
+      // failure (or a non-quiescent gate) leaks the context on purpose so a
+      // misbehaving HAL reads a closed gate instead of freed memory — the
+      // iOS host's poison-lease idiom.
+      teardownClean = teardownClean && callbackGate_->clearOwnerIfQuiescent();
+      if (teardownClean)
+        callbackGate_.reset();
+      else
+        callbackGate_.release();
+    }
     detail::MacAudioBufferProperties bufferProperties{selectedDevice_, selectedDeviceUid_};
     if (bufferOwnership_.token != 0) {
       try {
@@ -924,12 +949,12 @@ class MacAudioHostBackend final : public AudioHostBackend {
   static OSStatus renderCallback(void* context, AudioUnitRenderActionFlags* flags,
                                  const AudioTimeStamp* timestamp, UInt32,
                                  UInt32 frames, AudioBufferList* output) noexcept {
-    auto* self = static_cast<MacAudioHostBackend*>(context);
-    if (self == nullptr || output == nullptr) return noErr;
-    // Admit-and-count the whole callback, not just invokeAudioHostCallback:
-    // the preamble and postamble also touch members that stop() releases
-    // after draining. A refused entry means stop() is tearing down.
-    AudioInputCallbackScope admission(self->admission_);
+    auto* gate = static_cast<CallbackGate*>(context);
+    if (gate == nullptr || output == nullptr) return noErr;
+    // Admit-and-count through the outliving gate, then resolve the owner.
+    // A refused entry means stop() is tearing down (or the backend is gone):
+    // silence the outputs, which need no backend state, and return.
+    AudioInputCallbackOwnerScope admission(*gate);
     if (!admission) {
       for (UInt32 channel = 0; channel < output->mNumberBuffers; ++channel) {
         auto* bytes = static_cast<uint8_t*>(output->mBuffers[channel].mData);
@@ -938,6 +963,7 @@ class MacAudioHostBackend final : public AudioHostBackend {
       }
       return noErr;
     }
+    MacAudioHostBackend* self = admission.get();
     self->observedCallbackFrames_.store(frames, std::memory_order_relaxed);
     const uint64_t callbackTicks = mach_absolute_time();
     if (frames == 0 || frames > self->format_.maximumFrames ||
@@ -1116,7 +1142,10 @@ class MacAudioHostBackend final : public AudioHostBackend {
   bool allowSharedDeviceBufferChange_{false};
   std::atomic<uint32_t> observedCallbackFrames_{0};
   AudioHostCallbackEndpoint endpoint_{};
-  AudioInputCallbackGate admission_{};
+  // Registered with the HAL in place of `this`; see the comment above the
+  // backend for the outliving/quarantine contract.
+  using CallbackGate = AudioInputCallbackOwnerGate<MacAudioHostBackend>;
+  std::unique_ptr<CallbackGate> callbackGate_;
   std::atomic<AudioHostState> state_{AudioHostState::Closed};
   std::atomic<uint64_t> lastRouteGeneration_{0};
   std::atomic<uint64_t> streamGeneration_{0};

@@ -41,6 +41,9 @@ struct SessionSignals {
 // Admission gate for renderCallback: entry is counted and admitted in one
 // atomic word, so a callback that races the close in stop() either enters
 // before the drain observes zero or is refused without touching any member.
+// The gate is heap-allocated and registered with the HAL in place of `this`
+// so it can outlive the backend; stop() frees it only after a fully clean
+// teardown and deliberately leaks it otherwise.
 
 std::string nsString(NSString* value) {
   if (!value) return {};
@@ -185,7 +188,11 @@ class IosAudioInputBackend final : public AudioInputBackend {
       if (mach_timebase_info(&timebase_) != KERN_SUCCESS || timebase_.denom == 0)
         return failMessage("mach host-time conversion is unavailable", config.channel);
 
-      AURenderCallbackStruct callback{renderCallback, this};
+      // The heap gate is the HAL's callback context so it can be quarantined
+      // past backend destruction on an unclean teardown.
+      callbackGate_ = std::make_unique<CallbackGate>();
+      callbackGate_->open(this);
+      AURenderCallbackStruct callback{renderCallback, callbackGate_.get()};
       status = AudioUnitSetProperty(unit_, kAudioOutputUnitProperty_SetInputCallback,
                                     kAudioUnitScope_Global, 0, &callback,
                                     sizeof(callback));
@@ -225,10 +232,10 @@ class IosAudioInputBackend final : public AudioInputBackend {
                                ? "iOS audio route changed before capture started"
                                : std::move(readinessError),
                            channel_);
-      admission_.open();
+      if (callbackGate_) callbackGate_->open(this);
       const OSStatus status = AudioOutputUnitStart(unit_);
       if (status != noErr) {
-        admission_.beginClose();
+        if (callbackGate_) callbackGate_->beginClose();
         return fail("start RemoteIO", status, channel_);
       }
       started_ = true;
@@ -250,13 +257,27 @@ class IosAudioInputBackend final : public AudioInputBackend {
         // whatever the stop returns or whether the unit was ever started.
         // Any callback that did enter must finish before the unit is
         // disposed or the members it reads are cleared below.
-        admission_.beginClose();
-        if (started_) AudioOutputUnitStop(unit_);
-        while (admission_.inFlight() != 0) {
-          std::this_thread::yield();
+        if (callbackGate_) callbackGate_->beginClose();
+        bool teardownClean = true;
+        if (started_ && AudioOutputUnitStop(unit_) != noErr) teardownClean = false;
+        if (callbackGate_) {
+          while (callbackGate_->inFlight() != 0) {
+            std::this_thread::yield();
+          }
         }
-        if (initialized_) AudioUnitUninitialize(unit_);
-        AudioComponentInstanceDispose(unit_);
+        if (initialized_ && AudioUnitUninitialize(unit_) != noErr) teardownClean = false;
+        if (AudioComponentInstanceDispose(unit_) != noErr) teardownClean = false;
+        if (callbackGate_) {
+          // Free the HAL-reachable context only after a fully clean teardown:
+          // a late callback after that trusts the documented Dispose
+          // boundary. Any failure leaks the context on purpose so a
+          // misbehaving HAL reads a closed gate instead of freed memory.
+          teardownClean = teardownClean && callbackGate_->clearOwnerIfQuiescent();
+          if (teardownClean)
+            callbackGate_.reset();
+          else
+            callbackGate_.release();
+        }
       }
       unit_ = nullptr;
       started_ = false;
@@ -382,14 +403,14 @@ class IosAudioInputBackend final : public AudioInputBackend {
                                  const AudioTimeStamp* timestamp, UInt32,
                                  UInt32 frames, AudioBufferList*) {
     const uint64_t callbackTicks = mach_absolute_time();
-    IosAudioInputBackend* self = static_cast<IosAudioInputBackend*>(context);
-    if (!self) return noErr;
-    // Admit-and-count the whole callback before touching any member: stop()
-    // closes admission and drains before disposing the unit or clearing
-    // renderBuffer_/push_ below. A refused entry means teardown is under
-    // way; drop the block.
-    AudioInputCallbackScope admission(self->admission_);
+    auto* gate = static_cast<CallbackGate*>(context);
+    if (!gate) return noErr;
+    // Admit-and-count through the outliving gate, then resolve the owner.
+    // A refused entry means teardown is under way (or the backend is gone);
+    // drop the block.
+    AudioInputCallbackOwnerScope admission(*gate);
     if (!admission) return noErr;
+    IosAudioInputBackend* self = admission.get();
     if (!self->unit_ || !self->push_ || frames == 0) return noErr;
     if (frames > self->renderBuffer_.size()) {
       self->callbackFailure_.store(kCallbackTooLarge,
@@ -448,8 +469,12 @@ class IosAudioInputBackend final : public AudioInputBackend {
   AudioInputPush push_ = nullptr;
   void* context_ = nullptr;
   std::atomic<int32_t> callbackFailure_{0};
-  AudioInputCallbackGate admission_{};
-  std::string selectedUid_;
+  // Registered with the HAL in place of `this` so it can outlive the
+  // backend: a late callback after destruction reads the gate (refused)
+  // instead of freed backend memory, and an unclean teardown leaks it (the
+  // iOS host's poison-lease idiom).
+  using CallbackGate = AudioInputCallbackOwnerGate<IosAudioInputBackend>;
+  std::unique_ptr<CallbackGate> callbackGate_;  std::string selectedUid_;
   std::shared_ptr<SessionSignals> signals_;
   id routeObserver_ = nil;
   id interruptionObserver_ = nil;
