@@ -97,7 +97,9 @@ build_slice() {
     if [[ $source == *.mm ]]; then
       language_flags=(-fobjc-arc)
     fi
-    "$compiler" -std=c++20 -O3 -DNDEBUG "${language_flags[@]}" \
+    # bash 3.2 (stock macOS /bin/bash) errors on expanding an empty array
+    # under set -u; the ${arr[@]+...} guard is the portable idiom.
+    "$compiler" -std=c++20 -O3 -DNDEBUG ${language_flags[@]+"${language_flags[@]}"} \
       -fvisibility=hidden -fvisibility-inlines-hidden \
       -Wall -Wextra -Wpedantic -Werror -arch "$arch" -isysroot "$sdk_path" \
       -I"$repo_root/zcore/include" -c "$source" -o "$object"
@@ -140,7 +142,9 @@ build_slice() {
     if [[ $source == *.mm ]]; then
       language_flags=(-fobjc-arc)
     fi
-    "$compiler" -std=c++20 -O3 -DNDEBUG "${language_flags[@]}" \
+    # bash 3.2 (stock macOS /bin/bash) errors on expanding an empty array
+    # under set -u; the ${arr[@]+...} guard is the portable idiom.
+    "$compiler" -std=c++20 -O3 -DNDEBUG ${language_flags[@]+"${language_flags[@]}"} \
       -fvisibility=hidden -fvisibility-inlines-hidden \
       -Wall -Wextra -Wpedantic -Werror -arch "$arch" -isysroot "$sdk_path" \
       -I"$repo_root/zcore/include" -c "$source" -o "$object"
